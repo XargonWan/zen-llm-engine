@@ -34,9 +34,11 @@ Feel free to submit pull requests with improvements, new engines, or engine defi
 
 - zendriver-based (Chrome DevTools Protocol) support for web-based LLMs.
 - Unified REST API endpoints:
-  - `/api/ping`
+  - `/api/ping` (liveness only: proves the HTTP server is up)
+  - `/api/status` and `/api/health` (real health: per-engine breaker/queue/login state, RSS, zombies; never blocks on the browser)
   - `/api/engines`
   - `/api/engines/reload`
+  - `/api/engines/{engine}/recover` (close an engine's circuit breaker)
   - `/models` and `/models/{engine}`
   - `/login/{engine}` and `/login/{engine}/state`
   - `/engine/{engine}/prompt`
@@ -136,6 +138,47 @@ payload = {
 r = requests.post(url, json=payload)
 print(r.json())
 ```
+
+## Health, circuit breaker and manual sign-in
+
+A browser-driven engine that is signed out (or whose page changed) cannot recover
+by retrying, and every retry resets the shared Chromium. That is destructive: a
+sign-in you complete by hand in that browser (the web UI on port `3001`) is lost
+if Chromium is restarted before it flushes its cookies to disk. So each engine has
+a **circuit breaker**:
+
+- It opens after `ZEN_BREAKER_THRESHOLD` (default `3`) consecutive failed
+  requests, or immediately when a failed attempt coincides with a visible
+  "signed out" marker (`login_detection.login_button_css`).
+- While open, requests are rejected at once with **HTTP 503**, a `Retry-After`
+  header and `{"error": {"type": "engine_unavailable", "reason": "login" | "failures"}}`.
+  Queued requests are failed immediately and **the browser is left alone**.
+- `reason: "failures"` allows one trial request after `ZEN_BREAKER_COOLDOWN`
+  seconds (default `300`, doubling on each failed trial up to
+  `ZEN_BREAKER_MAX_COOLDOWN`, default `3600`).
+- **To sign in by hand**, first `POST /api/engines/<engine>/pause` (or
+  `POST /login/<engine>`, which pauses too) so requests stop navigating the tab
+  while you type; resume with the watcher or `.../recover`.
+- `reason: "login"` never retries on its own. Sign in through the web UI on
+  port `3001`; a read-only watcher (`ZEN_LOGIN_WATCH_INTERVAL`, default `15` s)
+  closes the breaker once the page looks signed in, or call
+  `POST /api/engines/{engine}/recover`.
+
+`GET /api/status` reports it all (it never takes the browser lock, never touches
+the browser or the database, so it answers even when a request is wedged):
+
+```json
+{"status": "ok|degraded|down",
+ "process": {"rss_mb": 812.4, "rss_warning": false, "zombie_processes": 0},
+ "browser": {"launches": 3, "last_launch_at": 1760000000.0, "pid": 1234},
+ "engines": [{"name": "gemini", "state": "down", "queue_depth": 0,
+              "last_success_at": 1760000000.0, "login_state": "unlogged",
+              "breaker": {"open": true, "reason": "login", "retry_in_seconds": null}}]}
+```
+
+`/api/health` returns the same body with HTTP 503 when any engine is `down`.
+`browser.launches` is a smoke detector: it should grow by a handful per day, not
+by hundreds. `ZEN_RSS_WARN_MB` (default `2048`) sets the `rss_warning` threshold.
 
 ## Debug mode
 

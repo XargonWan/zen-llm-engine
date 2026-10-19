@@ -17,6 +17,7 @@ from typing import Any, Dict, Set
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import (
     HTMLResponse,
+    JSONResponse,
     RedirectResponse,
     StreamingResponse,
 )
@@ -48,7 +49,9 @@ from core.agent_protocol import (
     to_openai_tool_calls,
 )
 from core.engine_manager import EngineManager
-from core import debug_mode
+from core.errors import EngineUnavailableError
+from core import debug_mode, proc_utils
+from core.zendriver_llm_base import get_browser_stats
 from core.models import (
     ChatCompletion,
     LegacyModelList,
@@ -298,10 +301,33 @@ def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
     return prompt_text, media_items
 
 
+# A single log record can be enormous: zendriver's CDP listener once logged a
+# ``StopIteration`` carrying an entire DOM tree (1.6 MB in ONE line, four times in
+# three days -- a quarter of the container's log). Bound every rendered line so
+# neither the log files, docker's json log nor the in-memory ring buffer can be
+# flooded by a single record. 0 disables the limit.
+_LOG_MAX_LINE = int(os.getenv("ZEN_LOG_MAX_LINE", "20000") or 0)
+
+
+class _BoundedFormatter(logging.Formatter):
+    """Formatter that truncates the rendered record (message + traceback)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        if _LOG_MAX_LINE > 0 and len(text) > _LOG_MAX_LINE:
+            dropped = len(text) - _LOG_MAX_LINE
+            text = f"{text[:_LOG_MAX_LINE]}... [truncated {dropped} chars]"
+        return text
+
+
 _buf_handler = _BufferHandler()
 _buf_handler.setLevel(logging.DEBUG)
+_buf_handler.setFormatter(_BoundedFormatter())
 
 logging.basicConfig(level=logging.INFO)
+for _root_handler in logging.getLogger().handlers:
+    # Same layout as basicConfig's default, just bounded.
+    _root_handler.setFormatter(_BoundedFormatter("%(levelname)s:%(name)s:%(message)s"))
 # Attach after basicConfig so the root logger already exists
 logging.getLogger().addHandler(_buf_handler)
 
@@ -320,7 +346,7 @@ try:
     )
     _file_handler.setLevel(logging.INFO)
     _file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
+        _BoundedFormatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s")
     )
     logging.getLogger().addHandler(_file_handler)
 except OSError as exc:  # pragma: no cover - read-only or absent mount
@@ -346,6 +372,7 @@ async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
     init_database()
     manager = EngineManager.get()           # initialize manager
     manager.start_orphan_cleanup()          # start periodic orphan cleanup
+    manager.start_login_watch()             # passive re-login detection (breaker recovery)
     _register_engine_routes(app)            # dynamic per-engine /name/prompt routes
 
     # Register signal handlers for graceful shutdown
@@ -370,6 +397,29 @@ async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
 
 
 app = FastAPI(title="Zen LLM Engine", version="0.1", lifespan=_lifespan)
+_STARTED_AT = time.time()
+
+
+@app.exception_handler(EngineUnavailableError)
+async def _engine_unavailable_handler(
+    request: Request, exc: EngineUnavailableError
+) -> JSONResponse:
+    """Map an open circuit breaker to a clear 503 that clients can back off on."""
+    message = str(exc)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": str(exc.retry_after)},
+        content={
+            "detail": message,
+            "error": {
+                "type": "engine_unavailable",
+                "engine": exc.engine,
+                "reason": exc.reason,
+                "retry_after": exc.retry_after,
+                "message": message,
+            },
+        },
+    )
 
 # Rate limiting (per ip, sliding window)
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -538,6 +588,75 @@ async def api_engines() -> Dict[str, Any]:
     return {"data": mgr.list_engines()}
 
 
+@app.get("/api/status")
+async def api_status() -> JSONResponse:
+    """Real health: per-engine breaker/queue/login state plus process vitals.
+
+    Unlike ``/api/ping`` (which only proves the HTTP server is up) this reports
+    whether engines can actually answer. It never takes the browser lock, never
+    touches the browser and never queries the database, so it stays responsive
+    when a request is wedged. Returns 200 always; ``status`` is ``ok``,
+    ``degraded`` (recent failures) or ``down`` (some engine's breaker is open).
+    """
+    engines = EngineManager.get().health_snapshot()
+    states = {e["state"] for e in engines}
+    overall = "down" if "down" in states else ("degraded" if "degraded" in states else "ok")
+    rss = proc_utils.rss_mb()
+    warn_mb = int(os.getenv("ZEN_RSS_WARN_MB", "2048") or 0)
+    body = {
+        "status": overall,
+        "uptime_seconds": round(time.time() - _STARTED_AT),
+        "process": {
+            "rss_mb": rss,
+            "rss_warning": bool(rss is not None and warn_mb and rss > warn_mb),
+            "zombie_processes": await asyncio.to_thread(proc_utils.count_zombies),
+        },
+        "browser": get_browser_stats(),
+        "engines": engines,
+    }
+    return JSONResponse(content=body)
+
+
+@app.get("/api/health")
+async def api_health() -> JSONResponse:
+    """Same body as ``/api/status`` but 503 when any engine is ``down``."""
+    response = await api_status()
+    payload = json.loads(response.body)
+    return JSONResponse(status_code=503 if payload["status"] == "down" else 200, content=payload)
+
+
+@app.post("/api/engines/{engine_name}/pause")
+async def api_engine_pause(engine_name: str) -> Dict[str, Any]:
+    """Pause an engine so you can sign in by hand without requests disturbing the tab.
+
+    Requests get a 503 while paused. It resumes by itself once the page looks signed
+    in (read-only watcher), or immediately with ``POST /api/engines/{engine}/recover``.
+    """
+    mgr = EngineManager.get()
+    try:
+        canonical = mgr._resolve(engine_name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Engine not found: {engine_name}")
+    mgr.pause_for_login(canonical)
+    return {
+        "status": "ok",
+        "engine": canonical,
+        "paused": True,
+        "resume": f"sign in, or POST /api/engines/{canonical}/recover",
+    }
+
+
+@app.post("/api/engines/{engine_name}/recover")
+async def api_engine_recover(engine_name: str) -> Dict[str, Any]:
+    """Close an engine's circuit breaker (e.g. right after signing in by hand)."""
+    mgr = EngineManager.get()
+    try:
+        canonical = mgr._resolve(engine_name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Engine not found: {engine_name}")
+    return {"status": "ok", "engine": canonical, "was_open": mgr.reset_breaker(canonical)}
+
+
 @app.get("/api/debug/page-html", response_class=HTMLResponse)
 async def api_debug_page_html(engine_name: str | None = None) -> HTMLResponse:
     """Return the current page HTML from the requested engine's browser session."""
@@ -663,7 +782,13 @@ async def login_engine(engine_name: str) -> Dict[str, Any]:
     except ValueError:
         raise HTTPException(status_code=404, detail="Engine not found")
 
+    # Someone is about to sign in by hand in this browser: stop requests from
+    # navigating/resetting the tab meanwhile (resumes once the page looks signed in).
+    mgr = EngineManager.get()
+    mgr.pause_for_login(engine_name)
     result = await engine.start_login_flow()
+    if result.get("login_state") == "logged":
+        mgr.note_login_state(engine_name, True)
     return result
 
 
@@ -674,7 +799,21 @@ async def login_state(engine_name: str) -> Dict[str, Any]:
     except ValueError:
         raise HTTPException(status_code=404, detail="Engine not found")
 
-    state = await engine.check_login_state()
+    mgr = EngineManager.get()
+    if mgr.login_blocked(engine_name):
+        # Breaker open for a missing login: the operator is probably signing in
+        # in this very browser. check_login_state() may navigate away from the
+        # login page, so only peek (read-only) here.
+        peeked = await engine.peek_login_state()
+        state = {
+            "logged_in": peeked is True,
+            "login_state": "logged" if peeked is True else ("unlogged" if peeked is False else "unknown"),
+            "breaker": "open",
+        }
+    else:
+        state = await engine.check_login_state()
+    if state.get("login_state") == "logged":
+        mgr.note_login_state(engine_name, True)
     return state
 
 
@@ -864,6 +1003,10 @@ async def _prompt(
     if _rate_limit_exceeded(req):
         raise HTTPException(status_code=429, detail="Too many requests")
 
+    # Reject up front (clean 503 + Retry-After) while the engine's circuit
+    # breaker is open, before any body parsing or a streaming response starts.
+    EngineManager.get().assert_available(engine_name)
+
     if explicit_prompt is None:
         payload = await _safe_parse_json(req)
         prompt_payload = payload.get("prompt") or payload.get("messages")
@@ -1019,6 +1162,9 @@ async def _prompt(
                         )
                     yield "data: [DONE]\n\n"
                 except Exception as e:
+                    if isinstance(e, EngineUnavailableError):
+                        inc_errors()
+                        raise
                     elapsed_ms = int((time.time() - start) * 1000)
                     log_prompt(
                         engine_name, "unknown", prompt_text, str(e), "error", elapsed_ms
@@ -1116,6 +1262,11 @@ async def _prompt(
         inc_errors()
         raise HTTPException(status_code=503, detail="Request cancelled due to reset")
     except HTTPException:
+        raise
+    except EngineUnavailableError:
+        # Breaker opened while this request was queued: surface the 503 as-is,
+        # without writing a (potentially huge) prompt row for every rejection.
+        inc_errors()
         raise
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)

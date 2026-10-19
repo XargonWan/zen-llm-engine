@@ -41,6 +41,7 @@ Schema (all fields except ``name`` and ``service_url`` are optional):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -130,6 +131,9 @@ class JsonEngine(ZendriverLLMBase):
 
         # ------------------------------------------------------------------ login rules
         self._login_cfg: dict[str, Any] = config.get("login_detection", {})
+        # True once the "state undetermined" fallback was logged for the
+        # current streak; cleared whenever a definite state is observed.
+        self._login_fallback_warned: bool = False
 
         # ------------------------------------------------------------------ response timing
         # Optional JSON key "response_max_wait" (seconds) overrides the built-in
@@ -164,6 +168,95 @@ class JsonEngine(ZendriverLLMBase):
         if self.base_account_selector is None:
             self.base_account_selector = self.media_config.get("base_account_selector")
 
+    # ---------------------------------------------------------------------- login markers
+
+    # One CDP round-trip instead of find-then-probe per element: no stale
+    # node handles, and "visible" means a non-empty bounding box.
+    _ANY_VISIBLE_JS = (
+        "((sels) => sels.some((s) => { try { return Array.from("
+        "document.querySelectorAll(s)).some((e) => { const r = "
+        "e.getBoundingClientRect(); return r.width > 0 && r.height > 0; }); } "
+        "catch (_) { return false; } }))(__SELECTORS__)"
+    )
+
+    async def _css_any_visible(self, tab: Any, selectors: list[str]) -> bool:
+        """True if any CSS selector matches an element with a non-empty box."""
+        if not selectors:
+            return False
+        expression = self._ANY_VISIBLE_JS.replace("__SELECTORS__", json.dumps(list(selectors)))
+        try:
+            return (await tab.evaluate(expression)) is True
+        except Exception:
+            return False
+
+    async def _login_css_marker_visible(self, tab: Any) -> bool:
+        """True if a ``login_button_css`` marker is visible right now.
+
+        This is the *opt-in, high-confidence* signal: an engine author has
+        declared exactly which elements mean "signed out". It alone may stop an
+        engine (see ``LoginRequiredError``). Never navigates.
+        """
+        return await self._css_any_visible(tab, self._login_cfg.get("login_button_css", []))
+
+    async def _login_marker_visible(self, tab: Any) -> bool:
+        """True if any configured "please sign in" element is visible right now.
+
+        Adds the legacy ``login_button_xpath`` on top of the CSS markers. XPath
+        rules in existing engine files are broad, so this is only used for the
+        informational login state, never to disable an engine.
+        """
+        if await self._login_css_marker_visible(tab):
+            return True
+        login_xpath: str = self._login_cfg.get("login_button_xpath", "")
+        if login_xpath:
+            for button in await self._xpath_all(tab, login_xpath):
+                if await self._element_is_displayed(button):
+                    return True
+        return False
+
+    def _on_service_host(self, url: str) -> bool:
+        prefix = str(self._login_cfg.get("url_prefix") or self.service_url or "").lower()
+        return bool(prefix) and url.lower().startswith(prefix)
+
+    async def _peek_logged_out(self, tab: Any) -> bool:  # type: ignore[override]
+        """Read-only: True only on positive evidence of a logged-out page.
+
+        Evidence = a declared ``login_button_css`` marker visible on the service
+        page. An off-service URL (login redirect, about:blank, ...) is *not*
+        evidence here: redirects are handled by the redirect-stall path.
+        """
+        url = (await self._current_url(tab)).lower()
+        if not self._on_service_host(url):
+            return False
+        return await self._login_css_marker_visible(tab)
+
+    async def peek_login_state(self) -> bool | None:  # type: ignore[override]
+        """Non-navigating probe used while the circuit breaker is open.
+
+        False: logged-out marker visible. True: a configured authenticated
+        element is visible, or the service page is fully loaded and no declared
+        logged-out marker is visible. None: cannot tell (no driver, off the
+        service host, page still loading, or no markers configured).
+        """
+        tab = self.driver
+        if tab is None or not self._initialized:
+            return None
+        cfg = self._login_cfg
+        try:
+            url = (await self._current_url(tab)).lower()
+            if not self._on_service_host(url):
+                return None
+            if await self._login_css_marker_visible(tab):
+                return False
+            if await self._css_any_visible(tab, cfg.get("authenticated_css_selectors", [])):
+                return True
+            if cfg.get("login_button_css"):
+                ready = await tab.evaluate("document.readyState")
+                return True if ready == "complete" else None
+        except Exception:
+            return None
+        return None
+
     # ---------------------------------------------------------------------- login
 
     async def _ensure_logged_in(self, tab: Any) -> bool:  # type: ignore[override]
@@ -188,6 +281,7 @@ class JsonEngine(ZendriverLLMBase):
                 els = await self._query_all(tab, css)
                 for e in els:
                     if await self._element_is_displayed(e):
+                        self._login_fallback_warned = False
                         return True
 
             url_prefix: str = cfg.get("url_prefix", self.service_url)
@@ -200,22 +294,38 @@ class JsonEngine(ZendriverLLMBase):
             if any(kw in current_url for kw in deny_keywords):
                 return False
 
-            # Step 3 — visible login button
-            login_xpath: str = cfg.get("login_button_xpath", "")
-            if login_xpath:
-                buttons = await self._xpath_all(tab, login_xpath)
-                for b in buttons:
-                    if await self._element_is_displayed(b):
-                        return False
+            # Steps 3 + 4 — visible login button / authenticated element. Single-page
+            # apps draw these a moment after the page "loads": checking once, too
+            # early, found neither and fell through to "assume logged in" (seen
+            # live: the check ran ~1 s after launch). ``login_settle_seconds``
+            # (opt-in, default 0 = single check) keeps looking for that long.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + float(cfg.get("login_settle_seconds", 0) or 0)
+            while True:
+                if await self._login_marker_visible(tab):
+                    self._login_fallback_warned = False
+                    return False
+                for css in auth_selectors:
+                    els = await self._query_all(tab, css)
+                    for e in els:
+                        if await self._element_is_displayed(e):
+                            self._login_fallback_warned = False
+                            return True
+                if loop.time() >= deadline:
+                    break
+                await asyncio.sleep(0.5)
 
-            # Step 4 — authenticated element present after navigation
-            for css in auth_selectors:
-                els = await self._query_all(tab, css)
-                for e in els:
-                    if await self._element_is_displayed(e):
-                        return True
-
-            # Step 5 — fallback
+            # Step 5 — fallback: no evidence either way. This used to be
+            # silent, which is how a logged-out engine kept reporting "logged
+            # in" for a day. Say so (once per streak) so it shows up in logs.
+            if not self._login_fallback_warned:
+                self._login_fallback_warned = True
+                logger.warning(
+                    "[json_engine:%s] login state undetermined: no authenticated "
+                    "element and no login marker matched; assuming logged in. "
+                    "Check login_detection selectors if this engine misbehaves.",
+                    self.ENGINE_NAME,
+                )
             return True
 
         except Exception as exc:

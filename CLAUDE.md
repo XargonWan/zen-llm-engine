@@ -125,6 +125,82 @@ re-checking the graceful-shutdown rule above — a short interval combined with
 a nuclear reset is what silently logged users out roughly every 5 minutes
 before this was fixed.
 
+## Failing engines must stop touching the browser (circuit breaker)
+
+Incident (Oct 2026): Gemini was signed out for ~28 hours. Every request failed
+`selenium_response_detection_timeout`, and each of the 5 attempts reset the
+browser, so Chromium was relaunched **848 times** in a day (once per ~100 s,
+12 of them SIGKILL). Because Chromium flushes cookies lazily, **no manual
+sign-in survived** — it was killed before reaching disk, and the profile showed
+`exit_type: Crashed`. The queue piled up (7 deep), `/login/<engine>/state` hung
+on `_BROWSER_ACCESS_LOCK`, and the engine never noticed it was logged out (the
+step-5 fallback in `JsonEngine._ensure_logged_in` silently assumed "logged in").
+
+What now exists (all engine-agnostic, see README "Health, circuit breaker…"):
+
+- `EngineManager` keeps an `EngineHealth` per engine and a circuit breaker
+  (`_admit` / `_record_success` / `_record_failure` / `_trip`). Open breaker →
+  `enqueue()` raises `EngineUnavailableError` (HTTP 503 + `Retry-After`), queued
+  jobs are failed at once, and nothing resets or relaunches the browser.
+- **Always verify a `login_button_css` marker against the live page, not just the
+  HTML**: Gemini's `a[aria-label='Sign in']` exists in the DOM but is 0 px wide
+  (hidden Google bar); the visible logged-out control is
+  `gem-button.mavatar-sign-in-button`. A marker that is in the DOM but not
+  visible never fires (that is also why the old XPath rule never did).
+- `LoginRequiredError` (core/errors.py) is raised by the retry loop when a failed
+  attempt coincides with a visible `login_detection.login_button_css` marker. It
+  is opt-in per engine on purpose: the legacy XPath rules are too loose to be
+  trusted to disable an engine.
+- A passive watcher (`_login_watch_tick`) closes a "login" breaker after two
+  consecutive read-only `peek_login_state()` results of "signed in". Peeks never
+  navigate and never take `_BROWSER_ACCESS_LOCK` (the operator may be mid
+  sign-in on that tab). `GET /login/<engine>/state` also peeks instead of using
+  `check_login_state()` while a login breaker is open, and `check_login_state()`
+  answers from cache (`"busy": true`) when the browser lock is held.
+- `GET /api/status` / `/api/health`: lock-free, browser-free, DB-free health.
+  `browser.launches` is the smoke detector for a reset loop.
+
+**Rule:** never add a code path that resets/relaunches the browser in response to
+a failure without going through the breaker, and never make a status/health
+probe wait on `_BROWSER_ACCESS_LOCK`.
+
+Browser launch and shutdown (why logins were lost): measured in a throwaway
+container, `Browser.close` over CDP makes Chromium exit by itself in ~0.3 s with
+its cookie store already flushed, but zendriver's `Browser.stop()` follows it with
+an immediate SIGTERM that cuts the shutdown short — cookies set in the last ~30 s
+(e.g. a login just completed) were lost on every "graceful" reset, and it took
+3.3 s (its terminate-then-kill timeout). So: `_stop_browser_with_timeout` now sends
+`Browser.close`, waits for the process to exit on its own, and only then
+SIGTERM/SIGKILL; **never call `Browser.stop()`** (a test guards this). Chromium is
+also launched by `_spawn_chromium` with `_chromium_args` (container-required flags
+only) and attached via CDP, instead of through `zd.Config`, which injects ~20
+automation flags (`--disable-web-security`, `--disable-extensions`, `--no-pings`,
+`--disable-features=...`, ...) that make the browser behave unlike a normal
+desktop one. Keep the flag list minimal; every flag needs a reason in
+`_chromium_args`' docstring. Known gap vs. a desktop browser: no WebGL (no GPU in
+the container; `--enable-unsafe-swiftshader` would add software WebGL).
+
+Zombies: `zendriver` holds Chromium as a `subprocess.Popen`; SIGKILLing it
+without `wait()` leaves a zombie (167 were found). `_kill_process_tree` now reaps
+(`core/proc_utils.py`), the orphan sweep skips zombies (`pgrep -f` matches them,
+so it used to "kill" the same 165 on every pass) and reaps direct-child zombies.
+`_dispose_browser` also closes the CDP connection after a hard kill so the old
+`Browser`/`Tab` objects can be freed.
+
+Memory (not fully root-caused): uvicorn reached 3.6 GB RSS after ~3 days and
+~1000 browser resets. The prompt-log query was ruled out (peak RSS 24 MB).
+The leading suspect is the leaked `Browser`/`Tab`/CDP objects from those resets
+(the surviving zombies prove their `Popen` objects stayed referenced). Mitigated
+by `_dispose_browser`, periodic `malloc_trim` (`proc_utils.trim_memory`), and
+`process.rss_mb`/`rss_warning` in `/api/status`. **Re-check RSS after a few days
+under the new code before calling it fixed.**
+
+Logs: the container's own file log rotates (20 MB x 3), but Docker's `json-file`
+driver did not — compose now sets `max-size`/`max-file`. Single records can also be
+huge (zendriver's CDP listener once logged a 1.6 MB `StopIteration` containing a
+whole DOM); `_BoundedFormatter` truncates every rendered line at
+`ZEN_LOG_MAX_LINE` (default 20000, `0` disables).
+
 ## Cross-engine browser access — one shared Tab, many engines
 
 All engines share one `Browser`/`Tab`, but `EngineManager` gives each engine

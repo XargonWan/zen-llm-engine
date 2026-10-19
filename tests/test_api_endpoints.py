@@ -117,6 +117,9 @@ def setup_engine_manager(monkeypatch):
     mgr = EngineManager.get()
     mgr.engines.clear()
     mgr.active_engine = None
+    # Circuit-breaker state lives on the singleton: POST /login/<engine> pauses
+    # the engine until a sign-in is seen, which must not leak into other tests.
+    mgr._health.clear()
 
     # Inject two synthetic descriptors so /models and /api/engines work
     from core.engine_manager import EngineDescriptor
@@ -163,6 +166,7 @@ def setup_engine_manager(monkeypatch):
 
     mgr.engines.clear()
     mgr.active_engine = None
+    mgr._health.clear()
 
 
 def test_ping():
@@ -3392,7 +3396,7 @@ def test_generate_response_serializes_across_engines(tmp_path):
 
 
 def test_build_options_includes_restore_session():
-    """_build_config's browser_args include --restore-last-session, and
+    """_chromium_args include --restore-last-session, and
     _ensure_clean_exit_preference writes the "clean exit" Preferences keys.
 
     Selenium's ``prefs`` experimental option (``profile.exit_type``,
@@ -3413,8 +3417,7 @@ def test_build_options_includes_restore_session():
         default_model="default",
         profile_dir=profile_dir,
     )
-    config = engine._build_config("/usr/bin/chromium")
-    args = config()
+    args = engine._chromium_args(9222)
     assert "--restore-last-session" in args
 
     engine._ensure_clean_exit_preference()

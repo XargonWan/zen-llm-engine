@@ -31,6 +31,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import math
 import os
 import subprocess
 import time as _time
@@ -38,6 +39,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Optional
+
+from core import proc_utils
+from core.errors import EngineUnavailableError, LoginRequiredError
 
 if TYPE_CHECKING:
     from core.zendriver_llm_base import ZendriverLLMBase
@@ -314,6 +318,42 @@ class _PromptJob:
     agent_mode: bool = False
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+@dataclass
+class EngineHealth:
+    """Per-engine request outcomes and circuit-breaker state (no browser access).
+
+    The breaker exists because a failing engine used to keep its queue full of
+    requests that each burned ~8 minutes and reset the shared browser several
+    times. Resetting the browser is destructive: Chromium flushes cookies
+    lazily, so a login the operator completes by hand in that browser was lost
+    before it reached disk (848 relaunches in a day, no sign-in survived).
+    While the breaker is open nothing is queued and nothing touches the browser.
+    """
+
+    consecutive_failures: int = 0
+    last_success_at: float | None = None
+    last_error: str | None = None
+    last_error_at: float | None = None
+    breaker_open: bool = False
+    breaker_reason: str | None = None  # "login" | "failures"
+    breaker_opened_at: float | None = None
+    retry_at: float | None = None  # "failures" only: when one trial is allowed
+    cooldown: float = 0.0
+    trial_in_flight: bool = False
+    recovery_checks: int = 0  # consecutive "looks logged in" peeks ("login" only)
+
+
+# Request errors caused by the caller's input, not by the engine's health.
+_CLIENT_ERRORS: tuple[type[BaseException], ...] = (ValueError, TypeError, NotImplementedError)
+
+
 # ---------------------------------------------------------------------------
 # EngineManager singleton
 # ---------------------------------------------------------------------------
@@ -340,6 +380,9 @@ class EngineManager:
         # Periodic orphan cleanup task — kills chromedriver/chromium processes
         # that are older than the configured threshold and no longer owned.
         self._orphan_cleanup_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        # Circuit breaker / health bookkeeping and the passive login watcher.
+        self._health: dict[str, EngineHealth] = {}
+        self._login_watch_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._load_descriptors()
         self._restore_default_engine()
 
@@ -493,6 +536,226 @@ class EngineManager:
         except ValueError:
             return None
 
+    # ---------------------------------------------------------------------- health / circuit breaker
+
+    def _health_for(self, canonical: str) -> EngineHealth:
+        return self._health.setdefault(canonical, EngineHealth())
+
+    @staticmethod
+    def _trial_due(h: EngineHealth, now: float) -> bool:
+        return (
+            h.breaker_reason == "failures"
+            and not h.trial_in_flight
+            and h.retry_at is not None
+            and now >= h.retry_at
+        )
+
+    def _unavailable(self, canonical: str, h: EngineHealth, now: float) -> EngineUnavailableError:
+        if h.breaker_reason == "login":
+            retry_after = _env_int("ZEN_LOGIN_RETRY_AFTER", 60)
+        elif h.trial_in_flight:
+            retry_after = 30
+        else:
+            retry_after = max(1, math.ceil((h.retry_at or now) - now))
+        return EngineUnavailableError(
+            canonical, h.breaker_reason or "failures", retry_after, h.last_error
+        )
+
+    def assert_available(self, name: str) -> None:
+        """Raise :class:`EngineUnavailableError` if the breaker would reject a request.
+
+        Side-effect free, so HTTP handlers can reject *before* they start a
+        streaming response. :meth:`enqueue` performs the real admission.
+        """
+        canonical = self._resolve(name)
+        h = self._health.get(canonical)
+        if h is None or not h.breaker_open:
+            return
+        now = _time.time()
+        if not self._trial_due(h, now):
+            raise self._unavailable(canonical, h, now)
+
+    def _admit(self, canonical: str) -> None:
+        h = self._health_for(canonical)
+        if not h.breaker_open:
+            return
+        now = _time.time()
+        if self._trial_due(h, now):
+            h.trial_in_flight = True
+            logger.info("[engine_manager] '%s': breaker half-open, admitting one trial request", canonical)
+            return
+        raise self._unavailable(canonical, h, now)
+
+    def _record_success(self, canonical: str) -> None:
+        h = self._health_for(canonical)
+        if h.breaker_open:
+            logger.info("[engine_manager] '%s': trial request succeeded, breaker closed", canonical)
+        h.consecutive_failures = 0
+        h.last_success_at = _time.time()
+        self._close_breaker(h)
+
+    @staticmethod
+    def _close_breaker(h: EngineHealth) -> None:
+        h.breaker_open = False
+        h.breaker_reason = None
+        h.breaker_opened_at = None
+        h.retry_at = None
+        h.cooldown = 0.0
+        h.trial_in_flight = False
+        h.recovery_checks = 0
+
+    def _record_failure(self, canonical: str, exc: BaseException) -> None:
+        if isinstance(exc, (EngineUnavailableError, *_CLIENT_ERRORS)):
+            return
+        h = self._health_for(canonical)
+        h.last_error = str(exc)[:300]
+        h.last_error_at = _time.time()
+        if isinstance(exc, LoginRequiredError):
+            self._trip(canonical, "login")
+            return
+        if h.breaker_open:
+            # The trial request failed: back off further. (A failure surfacing
+            # while the breaker is open for "login" changes nothing.)
+            if h.breaker_reason == "failures":
+                self._trip(canonical, "failures", escalate=True)
+            return
+        h.consecutive_failures += 1
+        if h.consecutive_failures >= max(1, _env_int("ZEN_BREAKER_THRESHOLD", 3)):
+            self._trip(canonical, "failures")
+
+    def _trip(self, canonical: str, reason: str, escalate: bool = False) -> None:
+        h = self._health_for(canonical)
+        now = _time.time()
+        if not h.breaker_open:
+            h.breaker_opened_at = now
+        h.breaker_open = True
+        h.breaker_reason = reason
+        h.trial_in_flight = False
+        h.recovery_checks = 0
+        if reason == "failures":
+            base = _env_int("ZEN_BREAKER_COOLDOWN", 300)
+            cap = _env_int("ZEN_BREAKER_MAX_COOLDOWN", 3600)
+            h.cooldown = float(min(max(h.cooldown * 2, base) if escalate else base, cap))
+            h.retry_at = now + h.cooldown
+        else:
+            h.retry_at = None
+        logger.error(
+            "[engine_manager] '%s': circuit breaker OPEN (%s) after %d consecutive failure(s); "
+            "requests are rejected with 503 and the browser is left alone. Last error: %s",
+            canonical, reason, h.consecutive_failures, h.last_error,
+        )
+        self._fail_queued(canonical, self._unavailable(canonical, h, now))
+
+    def _fail_queued(self, canonical: str, error: EngineUnavailableError) -> None:
+        """Fail every job still waiting so callers get an answer now, not in hours."""
+        queue = self._job_queues.get(canonical)
+        if queue is None:
+            return
+        failed = 0
+        while True:
+            try:
+                job = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not job.future.done():
+                job.future.set_exception(error)
+            queue.task_done()
+            failed += 1
+        if failed:
+            logger.warning("[engine_manager] '%s': failed %d queued request(s) immediately", canonical, failed)
+
+    def reset_breaker(self, name: str) -> bool:
+        """Close the breaker and clear the failure streak. True if it was open."""
+        canonical = self._resolve(name)
+        h = self._health_for(canonical)
+        was_open = h.breaker_open
+        h.consecutive_failures = 0
+        self._close_breaker(h)
+        if was_open:
+            logger.info("[engine_manager] '%s': circuit breaker closed manually/by login watcher", canonical)
+        return was_open
+
+    def pause_for_login(self, name: str) -> None:
+        """Stop sending requests to the browser so a human can sign in undisturbed.
+
+        Opens the "login" breaker: queued requests fail at once, new ones get a
+        503 and nothing navigates or resets the shared tab. It closes again when
+        the login watcher sees the page signed in, or via :meth:`reset_breaker`.
+        """
+        canonical = self._resolve(name)
+        h = self._health_for(canonical)
+        h.last_error = "paused for manual sign-in"
+        h.last_error_at = _time.time()
+        self._trip(canonical, "login")
+
+    def login_blocked(self, name: str) -> bool:
+        """True while the breaker is open because a manual sign-in is needed."""
+        h = self._health.get(self._resolve(name))
+        return bool(h and h.breaker_open and h.breaker_reason == "login")
+
+    def note_login_state(self, name: str, logged_in: bool) -> None:
+        """Close a "login" breaker once an explicit check reports a logged-in state.
+
+        Deliberately ignores "failures" breakers: being logged in says nothing
+        about whether the engine's selectors/page flow work again.
+        """
+        if logged_in and self.login_blocked(name):
+            self.reset_breaker(name)
+
+    def health_snapshot(self) -> list[dict[str, Any]]:
+        """Engine health for the status endpoint. Never touches the browser or DB."""
+        now = _time.time()
+        result: list[dict[str, Any]] = []
+        for desc in self._descriptors.values():
+            canonical = desc.name
+            h = self._health.get(canonical) or EngineHealth()
+            engine = self.engines.get(canonical)
+            queue = self._job_queues.get(canonical)
+            busy = [
+                now - started
+                for t in self._queue_workers.get(canonical, [])
+                if (started := getattr(t, "_job_started_at", None)) is not None
+            ]
+            login_state = "unknown"
+            checked_at = None
+            if engine is not None:
+                last = getattr(engine, "_last_login_state", None)
+                checked_at = getattr(engine, "_last_login_checked_at", None)
+                if last is not None:
+                    login_state = "logged" if last else "unlogged"
+            if h.breaker_open:
+                state = "down"
+            elif h.consecutive_failures > 0:
+                state = "degraded"
+            elif h.last_success_at is not None:
+                state = "ok"
+            else:
+                state = "idle"
+            retry_in = None
+            if h.breaker_open and h.breaker_reason == "failures" and h.retry_at is not None:
+                retry_in = max(0, math.ceil(h.retry_at - now))
+            result.append(
+                {
+                    "name": canonical,
+                    "state": state,
+                    "queue_depth": queue.qsize() if queue else 0,
+                    "worker_busy_seconds": round(max(busy), 1) if busy else None,
+                    "consecutive_failures": h.consecutive_failures,
+                    "last_success_at": h.last_success_at,
+                    "last_error": h.last_error,
+                    "last_error_at": h.last_error_at,
+                    "login_state": login_state,
+                    "login_checked_at": checked_at,
+                    "breaker": {
+                        "open": h.breaker_open,
+                        "reason": h.breaker_reason,
+                        "opened_at": h.breaker_opened_at,
+                        "retry_in_seconds": retry_in,
+                    },
+                }
+            )
+        return result
+
     # ---------------------------------------------------------------------- FIFO queue
 
     def _get_or_create_queue(self, canonical: str) -> asyncio.Queue[_PromptJob]:
@@ -581,13 +844,17 @@ class EngineManager:
                 logger.info(
                     f"[timing] worker_total ({engine_name}): {elapsed:.2f}s"
                 )
+                self._record_success(engine_name)
                 if not job.future.done():
                     job.future.set_result(_PromptResult(text=result_text, model_name=model_name))
             except asyncio.CancelledError:
+                # A cancelled trial must not wedge the breaker in "trial in flight".
+                self._health_for(engine_name).trial_in_flight = False
                 if not job.future.done():
                     job.future.cancel()
                 raise
             except Exception as exc:
+                self._record_failure(engine_name, exc)
                 if not job.future.done():
                     job.future.set_exception(exc)
             finally:
@@ -619,6 +886,9 @@ class EngineManager:
             engine/environment default (300 s).
         """
         canonical = self._resolve(engine_name)
+        # Fail fast while the circuit breaker is open: queueing behind a dead
+        # engine only delays the inevitable error by minutes per request.
+        self._admit(canonical)
         queue = self._get_or_create_queue(canonical)
         loop = asyncio.get_event_loop()
         future: asyncio.Future[_PromptResult] = loop.create_future()
@@ -717,6 +987,7 @@ class EngineManager:
         """
         orphan_age = int(os.getenv("SELENIUM_ORPHAN_AGE_THRESHOLD", "600"))
         killed = 0
+        seen: set[int] = set()
         protected = self._protected_pids()
         # "chromedriver"/"undetected_chromedriver" no longer exist in the
         # zendriver stack (no separate driver binary), kept here only so a
@@ -734,7 +1005,15 @@ class EngineManager:
                         if not pid_str.isdigit():
                             continue
                         pid = int(pid_str)
-                        if pid in protected:
+                        if pid in protected or pid in seen:
+                            continue
+                        # "chromium" and "chrome" match the same process: count
+                        # and kill it once. A zombie is already dead -- it only
+                        # needs reaping (below), not another SIGKILL; pgrep -f
+                        # keeps matching zombies, which is how the sweep used to
+                        # "kill" the same 165 processes on every pass.
+                        seen.add(pid)
+                        if proc_utils.process_state(pid) == "Z":
                             continue
                         # Check process age via /proc/<pid>/stat
                         try:
@@ -765,6 +1044,7 @@ class EngineManager:
                                         ["kill", "-9", str(pid)],
                                         check=False, capture_output=True, timeout=2,
                                     )
+                                    proc_utils.reap_pid(pid, timeout=1.0)
                                     killed += 1
                         except (FileNotFoundError, PermissionError, ValueError, IndexError):
                             # Process already gone or inaccessible
@@ -773,6 +1053,9 @@ class EngineManager:
                     pass
         except Exception:
             pass
+        reaped = proc_utils.reap_zombie_children()
+        if reaped:
+            logger.info("[engine_manager] Reaped %d zombie child process(es)", reaped)
         if killed > 0:
             logger.warning(
                 "[engine_manager] Orphan cleanup killed %d stale processes", killed
@@ -793,6 +1076,8 @@ class EngineManager:
                 killed = await asyncio.to_thread(self._cleanup_orphans)
                 if killed == 0:
                     logger.debug("[engine_manager] Orphan cleanup: no orphans found")
+                # Hand freed heap back to the OS; RSS otherwise only ratchets up.
+                await asyncio.to_thread(proc_utils.trim_memory)
             except asyncio.CancelledError:
                 logger.info("[engine_manager] Orphan cleanup task cancelled")
                 return
@@ -804,6 +1089,58 @@ class EngineManager:
         if self._orphan_cleanup_task is None or self._orphan_cleanup_task.done():
             self._orphan_cleanup_task = asyncio.ensure_future(self._orphan_cleanup_loop())
             logger.info("[engine_manager] Orphan cleanup task started")
+
+    async def _login_watch_tick(self) -> None:
+        """One pass of the passive login watcher.
+
+        For each engine whose breaker is open because a sign-in is needed, peek
+        (read-only, no navigation, no browser lock) at the page the operator is
+        working on. Two consecutive "looks logged in" peeks close the breaker.
+        """
+        from core.zendriver_llm_base import _BROWSER_ACCESS_LOCK
+
+        for name, h in list(self._health.items()):
+            if not (h.breaker_open and h.breaker_reason == "login"):
+                continue
+            engine = self.engines.get(name)
+            if engine is None or _BROWSER_ACCESS_LOCK.locked():
+                continue
+            try:
+                state = await asyncio.wait_for(engine.peek_login_state(), timeout=8.0)
+            except Exception:
+                state = None
+            if state is True:
+                h.recovery_checks += 1
+                if h.recovery_checks >= 2:
+                    self.reset_breaker(name)
+                    logger.info("[engine_manager] '%s': login detected, circuit breaker closed", name)
+            else:
+                h.recovery_checks = 0
+
+    async def _login_watch_loop(self) -> None:
+        interval = max(1, _env_int("ZEN_LOGIN_WATCH_INTERVAL", 15))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._login_watch_tick()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("[engine_manager] Login watcher error: %s", exc)
+
+    def start_login_watch(self) -> None:
+        """Start the passive login watcher (see :meth:`_login_watch_tick`)."""
+        if self._login_watch_task is None or self._login_watch_task.done():
+            self._login_watch_task = asyncio.ensure_future(self._login_watch_loop())
+
+    async def stop_login_watch(self) -> None:
+        if self._login_watch_task and not self._login_watch_task.done():
+            self._login_watch_task.cancel()
+            try:
+                await self._login_watch_task
+            except asyncio.CancelledError:
+                pass
+        self._login_watch_task = None
 
     async def stop_orphan_cleanup(self) -> None:
         """Cancel the periodic orphan cleanup task."""
@@ -818,8 +1155,9 @@ class EngineManager:
 
     async def stop_all(self) -> None:
         """Save cookies for every engine, then quit the shared Chrome driver."""
-        # First stop the orphan cleanup
+        # First stop the background tasks
         await self.stop_orphan_cleanup()
+        await self.stop_login_watch()
         for engine in self.engines.values():
             try:
                 await engine.stop()

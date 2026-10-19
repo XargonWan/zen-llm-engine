@@ -154,12 +154,23 @@ Detection runs in this order and stops at the first match:
 |------|-----|--------|
 | 1 | `url_prefix` | Navigate to this URL if `driver.current_url` does not start with it. |
 | 2 | `url_deny_keywords` | If any keyword is found in the current URL → **not logged in**. |
-| 3 | `login_button_xpath` | If any visible button matches the XPath → **not logged in**. |
+| 3 | `login_button_css` / `login_button_xpath` | If any visible element matches → **not logged in**. |
 | 4 | `authenticated_css_selectors` | If any listed element is visible → **logged in**. |
-| 5 | *(fallback)* | Assume logged in when none of the above triggered. |
+| 5 | *(fallback)* | Assume logged in when none of the above triggered. **Logged as a warning** (once per streak): it means the selectors matched nothing. |
 
-All four keys are optional. Omit the whole `login_detection` block for
+All keys are optional. Omit the whole `login_detection` block for
 public / no-auth services.
+
+**`login_button_css` is also the opt-in for fail-fast.** It is a list of CSS
+selectors for elements that mean "signed out" (e.g. `a[aria-label='Sign in']`),
+evaluated in a single JS round-trip. When a generation attempt fails *and* one of
+them is visible on the service page, the engine raises `LoginRequiredError`
+instead of resetting the browser and retrying, and the circuit breaker opens with
+`reason: "login"` (see README, "Health, circuit breaker and manual sign-in").
+Engines that set `allow_unlogged` get one extra attempt first, because a guest
+session can work. The legacy `login_button_xpath` is **not** used for this: the
+existing XPath rules are broad (one matches any `data-slot='button'`) and would
+disable healthy engines. Use precise selectors: a false positive stops the engine.
 
 ---
 
@@ -240,6 +251,9 @@ curl -s -X POST http://localhost:8000/engine/my_service/prompt \
 |----------|--------|-------------|
 | `/api/engines` | GET | List all discovered engines (metadata only, no browser instance created). |
 | `/api/engines/reload` | POST | Re-scan `engines/` and update the registry. Returns new engine list. |
+| `/api/status` | GET | Engine breaker/queue/login state and process vitals. Never blocks on the browser. |
+| `/api/health` | GET | Same body; HTTP 503 when any engine is `down` (breaker open). |
+| `/api/engines/{name}/recover` | POST | Close an engine's circuit breaker. |
 | `/engine/{name}/prompt` | POST | Send a prompt to any engine by name or alias. Body: `{"prompt": "..."}`. |
 | `/models` | GET | Legacy endpoint — same data as `/api/engines` in a different shape. |
 

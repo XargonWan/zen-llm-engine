@@ -150,6 +150,13 @@
     "url_prefix": "https://gemini.google.com",
     "url_deny_keywords": ["signin", "login", "accounts.google.com"],
     "login_button_xpath": "//a[@aria-label='Sign in'] | //a[@aria-label='Accedi']",
+    "login_settle_seconds": 6,
+    "login_button_css": [
+      "gem-button.mavatar-sign-in-button",
+      "a[aria-label='Sign in']",
+      "a[aria-label='Accedi']",
+      "a[href*='accounts.google.com/ServiceLogin']"
+    ],
     "authenticated_css_selectors": [
       "a[aria-label*='Google Account']",
       "a[href*='SignOutOptions']"

@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -29,9 +30,26 @@ import zendriver as zd
 from zendriver.core.keys import KeyEvents, KeyModifiers, SpecialKeys
 
 from core.agent_protocol import AGENT_TAIL_MARKER
-from core import debug_mode
+from core import debug_mode, proc_utils
+from core.errors import LoginRequiredError
 
 logger = logging.getLogger("zendriver_llm_base")
+
+# Browser launch bookkeeping, surfaced by GET /api/status. A healthy deployment
+# launches the shared Chromium once per many hours; hundreds of launches per day
+# means something is resetting it in a loop (which also destroys any login the
+# operator is completing by hand, since Chromium flushes cookies lazily).
+_BROWSER_LAUNCHES = 0
+_LAST_BROWSER_LAUNCH_AT: Optional[float] = None
+
+
+def get_browser_stats() -> Dict[str, Any]:
+    """Return launch counters for the shared browser (no browser access)."""
+    return {
+        "launches": _BROWSER_LAUNCHES,
+        "last_launch_at": _LAST_BROWSER_LAUNCH_AT,
+        "pid": get_shared_browser_pid(),
+    }
 
 # Matches a bare error line that carries a numeric failure code, e.g.
 # "Something went wrong (1076)", "Error 1076" or a lone parenthesised
@@ -81,6 +99,13 @@ def _browser_pid(browser: zd.Browser) -> Optional[int]:
     return getattr(browser, "_process_pid", None)
 
 
+def _free_port() -> int:
+    """An unused localhost TCP port for the CDP endpoint."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def get_shared_browser_pid() -> Optional[int]:
     """Return the PID of the currently active shared browser, if any.
 
@@ -115,33 +140,101 @@ def _kill_process_tree(pid: int) -> None:
         pass
     except Exception:
         pass
+    # The browser is our direct child (zendriver keeps it as a Popen). Nobody
+    # calls wait() on a SIGKILLed one, so without this it stays a zombie
+    # forever -- 167 of them were found after a few days of resets.
+    proc_utils.reap_pid(pid, timeout=2.0)
 
 
-async def _stop_browser_with_timeout(browser: zd.Browser, timeout: float = 10.0) -> bool:
-    """Attempt a graceful ``browser.stop()`` with a hard timeout.
+async def _dispose_browser(browser: Optional[zd.Browser]) -> None:
+    """Release what ``Browser.stop()`` would have, after a hard kill.
 
-    ``Browser.stop()`` already does the right thing internally (SIGTERM, wait
-    up to ~3s, SIGKILL fallback) because zendriver owns the Chrome subprocess
-    directly — there is no separate chromedriver binary in between, so no
-    pattern-matching pkill dance is needed to find "the" browser process. This
-    wrapper only exists as an outer safety net for the case where ``stop()``
-    itself hangs (e.g. a wedged CDP websocket that never completes ``aclose``).
-
-    Returns True if ``stop()`` completed normally, False if a hard kill of the
-    known PID was required.
+    The nuclear paths SIGKILL the process and drop the reference, but leave the
+    CDP websocket/listener tasks behind; with ~1000 resets in a day that is
+    memory that is never returned. Closing the connection lets the Browser,
+    its Tabs and their cached DOM nodes be garbage-collected.
     """
-    try:
-        await asyncio.wait_for(browser.stop(), timeout=timeout)
-        return True
-    except Exception as exc:
-        logger.warning(
-            "[zendriver] browser.stop() did not complete cleanly within %ss: %s — force killing",
-            timeout, exc,
-        )
-    pid = _browser_pid(browser)
+    if browser is not None:
+        connection = getattr(browser, "connection", None)
+        try:
+            if connection is not None and not connection.closed:
+                await asyncio.wait_for(connection.aclose(), timeout=3.0)
+        except Exception as exc:
+            logger.debug("[zendriver] dispose: closing CDP connection failed: %s", exc)
+    await asyncio.to_thread(proc_utils.trim_memory)
+
+
+def _process_exited(proc: Optional[subprocess.Popen], pid: Optional[int]) -> bool:
+    """True once the browser process is gone (or was never known)."""
+    if proc is not None:
+        return proc.poll() is not None
     if pid:
-        await asyncio.to_thread(_kill_process_tree, pid)
-    return False
+        return proc_utils.process_state(pid) in (None, "Z")
+    return True
+
+
+async def _wait_for_exit(
+    proc: Optional[subprocess.Popen], pid: Optional[int], timeout: float
+) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while not _process_exited(proc, pid):
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
+    return True
+
+
+async def _stop_browser_with_timeout(
+    browser: zd.Browser, timeout: float = 10.0, term_grace: float = 5.0
+) -> bool:
+    """Quit Chromium the way a user closing the window does, and let it finish.
+
+    Order matters, and it is what keeps a manual sign-in alive:
+
+    1. ``Browser.close`` over CDP, then wait up to *timeout* seconds for the
+       process to exit **by itself**. Measured: Chromium exits in ~0.3 s this way
+       and has already flushed its cookie store (persistent and session cookies
+       both survive an immediate relaunch).
+    2. Only if it does not, SIGTERM and a short wait, then SIGKILL.
+
+    ``zendriver``'s own ``Browser.stop()`` is deliberately not used: it sends
+    SIGTERM right after ``Browser.close``, which interrupts Chromium's orderly
+    shutdown before the cookie flush -- cookies set in the last ~30 s were lost
+    on every "graceful" reset (measured: both cookies gone, and stop() took 3.3 s,
+    i.e. its SIGTERM-then-kill timeout).
+
+    Returns True if Chromium quit on its own, False if it had to be signalled.
+    """
+    proc: Optional[subprocess.Popen] = getattr(browser, "_process", None)
+    pid = _browser_pid(browser)
+    connection = getattr(browser, "connection", None)
+
+    try:
+        if connection is not None and not connection.closed:
+            await asyncio.wait_for(connection.send(zd.cdp.browser.close()), timeout=3.0)
+    except Exception as exc:
+        # Expected when Chromium drops the socket while quitting.
+        logger.debug("[zendriver] Browser.close: %s", exc)
+
+    graceful = await _wait_for_exit(proc, pid, timeout)
+    if not graceful and pid:
+        logger.warning(
+            "[zendriver] Chromium did not quit within %ss of Browser.close — sending SIGTERM", timeout,
+        )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger.debug("[zendriver] SIGTERM failed: %s", exc)
+        if not await _wait_for_exit(proc, pid, term_grace):
+            logger.warning("[zendriver] Chromium ignored SIGTERM — force killing")
+            await asyncio.to_thread(_kill_process_tree, pid)
+    if pid:
+        await asyncio.to_thread(proc_utils.reap_pid, pid, 1.0)
+    await _dispose_browser(browser)
+    return graceful
 
 
 def _remove_profile_lock_files(profile_dir: str) -> None:
@@ -201,6 +294,7 @@ async def force_kill_session() -> None:
     pid = _browser_pid(browser) if browser is not None else None
     if pid:
         await asyncio.to_thread(_kill_process_tree, pid)
+        await _dispose_browser(browser)
     else:
         # No known PID (browser never started, or already gone) — nothing
         # targeted to kill. We deliberately do NOT fall back to a system-wide
@@ -251,6 +345,7 @@ class ZendriverLLMBase:
         logger.info(f"[zendriver] Chrome profile_dir={self.profile_dir}")
 
         self._last_login_state: Optional[bool] = None
+        self._last_login_checked_at: Optional[float] = None
 
         # Selector lists used by the generate flow — override in subclasses.
         self.prompt_area_selectors: list[str] = [
@@ -464,51 +559,88 @@ class ZendriverLLMBase:
             logger.warning(f"[zendriver] Could not get Chromium version: {e}")
         return None
 
-    def _build_config(self, chromium_binary: str) -> zd.Config:
-        """Build the zendriver Config matching the previous Selenium options.
+    def _chromium_args(self, port: int) -> list[str]:
+        """Command-line flags for Chromium: a normal browser, plus what a container needs.
 
-        A few of the previous flags now map to first-class Config fields
-        (headless=, user_data_dir=, sandbox=) instead of raw --args because
-        zendriver's Config.add_argument() rejects those substrings outright
-        (they must go through the dedicated kwargs).
+        Deliberately minimal. This used to launch through zendriver's own
+        ``Config``, which adds ~20 automation-style flags on top of ours
+        (``--disable-web-security``, ``--disable-extensions``, ``--no-pings``,
+        ``--disable-component-update``, ``--disable-background-networking``,
+        ``--disable-features=...site-per-process...``, ``--disable-gpu``,
+        throttling/hang-monitor switches, a WebRTC policy, ...). They change how
+        pages behave and are exactly what a site's bot detection looks for; the
+        owner wants this browser to behave like their desktop one.
 
-        NOTE on --disable-features: Chrome only honours the *last*
-        --disable-features flag on its command line when several are given.
-        zendriver's own Config unconditionally emits two
-        (``IsolateOrigins,DisableLoadExtensionCommandLineSwitch,site-per-process``
-        as a default, then a second hardcoded
-        ``IsolateOrigins,site-per-process``) before appending ours. If we
-        passed our own --disable-features separately it would silently win
-        and switch site-isolation back on — the opposite of what zendriver
-        wants for stealth. So we fold zendriver's own two feature names into
-        our single flag instead of adding a competing one.
+        What remains, and why:
+
+        * ``--user-data-dir`` / ``--remote-debugging-port`` / ``--remote-allow-origins``:
+          the profile and the CDP channel the engine drives it through.
+        * ``--no-sandbox`` and ``--disable-dev-shm-usage``: required in the container
+          (no user namespaces, 64 MB /dev/shm). Invisible to websites.
+        * ``--password-store=basic``: keeps the cookie-encryption key identical on
+          every launch (autodetecting a keyring could change it and make every
+          cookie undecryptable = logged out). Invisible to websites.
+        * ``--restore-last-session``: Chrome's "continue where you left off", which
+          also keeps session cookies across restarts.
+        * ``--no-first-run`` / ``--no-default-browser-check`` /
+          ``--disable-session-crashed-bubble``: suppress UI prompts only.
+        * ``--start-maximized``: a normal window size instead of a fixed 1280x900.
         """
-        essential_args = [
-            "--disable-gpu",
-            "--disable-extensions",
-            "--disable-plugins",
-            "--disable-web-security",
-            "--allow-running-insecure-content",
-            "--disable-features=IsolateOrigins,DisableLoadExtensionCommandLineSwitch,"
-            "site-per-process,VizDisplayCompositor,CalculateNativeWinOcclusion",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
+        args = [
+            f"--user-data-dir={self.profile_dir}",
+            f"--remote-debugging-port={port}",
+            "--remote-allow-origins=*",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--password-store=basic",
             "--restore-last-session",
-            "--disable-hang-monitor",
-            "--disable-ipc-flooding-protection",
-            "--disable-back-forward-cache",
-            "--js-flags=--max-old-space-size=512",
-            "--window-size=1280,900",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-session-crashed-bubble",
+            "--start-maximized",
         ]
+        if self.headless:
+            args.append("--headless=new")
+        args.append("about:blank")
+        return args
 
-        return zd.Config(
-            user_data_dir=self.profile_dir,
-            headless=self.headless,
-            browser_executable_path=chromium_binary,
-            browser_args=essential_args,
-            sandbox=False,
+    def _spawn_chromium(self, chromium_binary: str, port: int) -> subprocess.Popen[bytes]:
+        logger.info("[zendriver] Launching Chromium: %s %s", chromium_binary, " ".join(self._chromium_args(port)))
+        return subprocess.Popen(
+            [chromium_binary, *self._chromium_args(port)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+
+    async def _attach_browser(
+        self, proc: subprocess.Popen[bytes], port: int, timeout: float = 30.0
+    ) -> zd.Browser:
+        """Connect zendriver to the Chromium we just started and make it own *proc*.
+
+        ``user_data_dir`` is passed so zendriver treats the profile as custom and
+        never deletes it. ``_process`` is set by hand because zendriver does not
+        know the process when attached: ``Browser.stopped`` and our PID helpers
+        read it.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        last: Optional[Exception] = None
+        while loop.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"Chromium exited during startup (exit code {proc.returncode})")
+            try:
+                browser = await zd.Browser.create(
+                    config=zd.Config(user_data_dir=self.profile_dir, host="127.0.0.1", port=port)
+                )
+            except Exception as exc:
+                last = exc
+                await asyncio.sleep(0.3)
+                continue
+            browser._process = proc
+            browser._process_pid = proc.pid
+            return browser
+        raise RuntimeError(f"Could not attach to Chromium on port {port}: {last!r}")
 
     def _ensure_clean_exit_preference(self) -> None:
         """Tell Chrome the previous session ended cleanly.
@@ -645,7 +777,7 @@ class ZendriverLLMBase:
         profile-dir lock conflicts and to preserve a single login session
         across engines.
         """
-        global _shared_browser
+        global _shared_browser, _BROWSER_LAUNCHES, _LAST_BROWSER_LAUNCH_AT
 
         if self.driver is not None and _shared_browser is not None and self.driver.browser is _shared_browser:
             return self.driver
@@ -671,19 +803,22 @@ class ZendriverLLMBase:
             chromium_binary = self._locate_chromium_binary() or "/usr/bin/chromium"
             await asyncio.to_thread(self._get_chromium_major_version, chromium_binary)  # diagnostics only
 
-            config = self._build_config(chromium_binary)
-
             max_retries = 3
             last_err: Optional[Exception] = None
             browser: Optional[zd.Browser] = None
             for attempt in range(max_retries):
+                proc: Optional[subprocess.Popen[bytes]] = None
                 try:
                     logger.info(f"[zendriver] Browser start attempt {attempt + 1}/{max_retries}")
-                    browser = await zd.Browser.create(config=config)
+                    port = _free_port()
+                    proc = await asyncio.to_thread(self._spawn_chromium, chromium_binary, port)
+                    browser = await self._attach_browser(proc, port)
                     break
                 except Exception as err:
                     last_err = err
                     logger.warning(f"[zendriver] Attempt {attempt + 1}/{max_retries} failed: {err}")
+                    if proc is not None and proc.poll() is None:
+                        await asyncio.to_thread(_kill_process_tree, proc.pid)
                     await asyncio.to_thread(self._cleanup_chromium_remnants)
                     if attempt < max_retries - 1:
                         await asyncio.sleep(1)
@@ -703,6 +838,8 @@ class ZendriverLLMBase:
             self._initialized = True
             self._driver_start_time = time.time()
             _shared_browser = browser
+            _BROWSER_LAUNCHES += 1
+            _LAST_BROWSER_LAUNCH_AT = time.time()
             logger.info("[zendriver] Browser initialized successfully (shared)")
             return self.driver
 
@@ -742,12 +879,46 @@ class ZendriverLLMBase:
         try:
             logged = await self._ensure_logged_in(self.driver)
             self._last_login_state = logged
+            self._last_login_checked_at = time.time()
             if logged:
                 self._maybe_save_cookies()
             return logged
         except Exception as e:
             logger.warning(f"Unable to determine login state: {e}")
             return False
+
+    async def _peek_logged_out(self, tab: zd.Tab) -> bool:
+        """True only on *positive* evidence that the current page is logged out.
+
+        Read-only by contract: must never navigate, reload or click, because the
+        operator may be mid sign-in on this very tab. Subclasses with a
+        ``login_detection`` config override it; the default has no evidence.
+        """
+        return False
+
+    async def peek_login_state(self) -> Optional[bool]:
+        """Non-navigating login probe: True / False, or None when unknown.
+
+        Used by the background login watcher while the engine's circuit breaker
+        is open. Unlike :meth:`check_login_state` it neither takes the browser
+        lock nor navigates, so it cannot disturb a manual sign-in.
+        """
+        return None
+
+    async def _login_lost(self) -> bool:
+        """Bounded, never-raising wrapper around :meth:`_peek_logged_out`."""
+        tab = self.driver
+        if tab is None:
+            return False
+        try:
+            lost = await asyncio.wait_for(self._peek_logged_out(tab), timeout=5.0)
+        except Exception as exc:
+            logger.debug("[zendriver] login peek failed: %s", exc)
+            return False
+        if lost:
+            self._last_login_state = False
+            self._last_login_checked_at = time.time()
+        return bool(lost)
 
     async def start_login_flow(self, timeout: int = 60) -> dict[str, Any]:
         """Open the service URL in the browser (non-blocking) and return login state."""
@@ -771,6 +942,16 @@ class ZendriverLLMBase:
                 logged = bool(self._last_login_state)
                 state = "logged" if logged else "unlogged"
                 return {"logged_in": logged, "login_state": state}
+
+            # A live check needs the shared tab, which an in-flight request owns
+            # (possibly for many minutes if it is wedged). Waiting made this
+            # endpoint hang for as long as the queue was stuck -- exactly when
+            # someone asks "is it logged in?". Answer from the cached state and
+            # say so instead.
+            if _BROWSER_ACCESS_LOCK.locked():
+                last = self._last_login_state
+                state = "unknown" if last is None else ("logged" if last else "unlogged")
+                return {"logged_in": bool(last), "login_state": state, "busy": True}
 
             # Waits for any in-flight generate_response/start_login_flow on
             # another engine to finish before touching the shared tab -- a
@@ -973,6 +1154,7 @@ class ZendriverLLMBase:
         pid = _browser_pid(browser) if browser is not None else None
         if pid:
             await asyncio.to_thread(_kill_process_tree, pid)
+            await _dispose_browser(browser)
         _remove_profile_lock_files(self.profile_dir)
 
     async def _reset_driver(self) -> None:
@@ -1303,6 +1485,35 @@ class ZendriverLLMBase:
                         "service requires authentication — failing fast without retry."
                     )
                     raise
+
+                if isinstance(e, LoginRequiredError):
+                    raise
+
+                # A failed attempt on a page that visibly asks to sign in is a
+                # login problem, not a flaky page: resetting the browser and
+                # retrying cannot fix it, and every relaunch can kill a login the
+                # operator is finishing by hand in this very browser (Chromium
+                # only flushes cookies lazily -- observed: 848 relaunches in a
+                # day, no manual sign-in ever survived). Engines that allow
+                # guest use get one more attempt before we give up, since a
+                # guest session can legitimately work -- but WITHOUT resetting
+                # the browser: seconds after a manual sign-in was pasted in, that
+                # reset wiped it (observed live right after the first deploy).
+                if not self._is_dead_session(e) and await self._login_lost():
+                    if attempt >= 1 or not self.allow_unlogged:
+                        logger.error(
+                            "[zendriver] Attempt %d failed and the page shows a logged-out "
+                            "state — login required, not retrying (%s)", attempt + 1, e,
+                        )
+                        raise LoginRequiredError(
+                            f"login required: the service shows a logged-out page ({e})"
+                        ) from e
+                    logger.warning(
+                        "[zendriver] Attempt %d failed on a logged-out page; one more try "
+                        "as a guest, leaving the browser untouched (%s)", attempt + 1, e,
+                    )
+                    self._navigate_on_next_attempt = True
+                    continue
 
                 is_chunking_freeze = any(msg in str(e) for msg in [
                     "Send button did not become ready",
