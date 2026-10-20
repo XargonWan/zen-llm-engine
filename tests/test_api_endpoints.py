@@ -3397,7 +3397,7 @@ def test_generate_response_serializes_across_engines(tmp_path):
 
 def test_build_options_includes_restore_session():
     """_chromium_args include --restore-last-session, and
-    _ensure_clean_exit_preference writes the "clean exit" Preferences keys.
+    _ensure_profile_preferences writes the "clean exit" Preferences keys.
 
     Selenium's ``prefs`` experimental option (``profile.exit_type``,
     ``profile.exited_cleanly``) has no zendriver Config equivalent, so that
@@ -3420,12 +3420,14 @@ def test_build_options_includes_restore_session():
     args = engine._chromium_args(9222)
     assert "--restore-last-session" in args
 
-    engine._ensure_clean_exit_preference()
+    engine._ensure_profile_preferences()
     prefs_path = os.path.join(profile_dir, "Default", "Preferences")
     with open(prefs_path, encoding="utf-8") as fh:
         data = json.load(fh)
     assert data["profile"]["exit_type"] == "Normal"
     assert data["profile"]["exited_cleanly"] is True
+    # Browser-level sign-in stays off: a website login must be plain cookies.
+    assert data["signin"]["allowed"] is False
 
 
 def test_sync_generate_response_dynamic_chunking_retry():

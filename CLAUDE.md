@@ -180,6 +180,17 @@ desktop one. Keep the flag list minimal; every flag needs a reason in
 `_chromium_args`' docstring. Known gap vs. a desktop browser: no WebGL (no GPU in
 the container; `--enable-unsafe-swiftshader` would add software WebGL).
 
+Browser-level sign-in must stay off (Oct 2026): a login lost on *every* Chromium
+restart, even a clean one (last logged-in request 04:57:03, relaunch 04:57:29, guest
+from 04:57:31). `chrome://signin-internals` showed `Account Consistency: DICE` with an
+active reconciler, and the profile held `Missing authorization code due to OAuth outage
+in Dice` -- the web login never linked to a browser account, and
+`gaia_cookie.changed_time` moved at the relaunch. Now `signin.allowed=false`
+(`_ensure_profile_preferences`) plus the `BrowserSignin=0` policy
+(`webtop/chromium-policies/zen.json`) give `Account Consistency: None`. Unconfirmed
+until a real login survives `POST /api/session/reset`; Chromium's own account/cookie
+logging goes to `logs/chromium.log` for that check.
+
 Zombies: `zendriver` holds Chromium as a `subprocess.Popen`; SIGKILLing it
 without `wait()` leaves a zombie (167 were found). `_kill_process_tree` now reaps
 (`core/proc_utils.py`), the orphan sweep skips zombies (`pgrep -f` matches them,

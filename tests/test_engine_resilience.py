@@ -779,6 +779,48 @@ def test_chromium_launches_like_a_normal_browser(tmp_path):
     assert args[-1] == "about:blank"
 
 
+def test_preferences_keep_existing_profile_state_and_disable_signin(tmp_path):
+    import json
+
+    default_dir = tmp_path / "Default"
+    default_dir.mkdir()
+    (default_dir / "Preferences").write_text(
+        json.dumps({"profile": {"avatar_index": 3}, "signin": {"allowed": True, "x": 1}, "other": 1})
+    )
+    _bare_engine(tmp_path, allow_unlogged=False)._ensure_profile_preferences()
+    data = json.loads((default_dir / "Preferences").read_text())
+    assert data["profile"] == {"avatar_index": 3, "exit_type": "Normal", "exited_cleanly": True}
+    assert data["signin"] == {"allowed": False, "x": 1}
+    assert data["other"] == 1
+
+
+def test_chromium_stderr_goes_to_a_bounded_log_file(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.setenv("ZEN_LOG_DIR", str(tmp_path / "logs"))
+    engine = _bare_engine(tmp_path, allow_unlogged=False)
+    seen: dict[str, Any] = {}
+
+    class _Popen:
+        def __init__(self, cmd, **kwargs):
+            seen["cmd"], seen["kwargs"] = cmd, kwargs
+
+    monkeypatch.setattr(subprocess, "Popen", _Popen)
+    engine._spawn_chromium("/usr/bin/chromium", 9222)
+    assert "--enable-logging=stderr" in seen["cmd"]
+    assert any(a.startswith("--vmodule=account_reconcilor=2") for a in seen["cmd"])
+    assert seen["cmd"][-1] == "about:blank"
+    assert (tmp_path / "logs" / "chromium.log").exists()
+    assert seen["kwargs"]["stderr"] is not subprocess.DEVNULL
+
+    # A log past the cap is moved aside instead of growing forever.
+    log = tmp_path / "logs" / "chromium.log"
+    log.write_bytes(b"x" * (5 * 1024 * 1024 + 1))
+    engine._spawn_chromium("/usr/bin/chromium", 9222)
+    assert (tmp_path / "logs" / "chromium.log.1").stat().st_size > 5 * 1024 * 1024
+    assert log.stat().st_size < 1024
+
+
 class _FakeConnection:
     closed = False
 
