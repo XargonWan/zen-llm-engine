@@ -92,6 +92,12 @@ RUN apt-get update && \
     chromium --version
 
 
+# Browser-level account sign-in off (BrowserSignin=0, SyncDisabled). A website
+# login (Gemini, ...) must stay plain cookies: with Chromium's own sign-in on,
+# its account reconciler ran at every launch and the web login was gone right
+# after a relaunch. See ZendriverLLMBase._ensure_profile_preferences.
+COPY webtop/chromium-policies/zen.json /etc/chromium/policies/managed/zen.json
+
 # Chromium profile setup (in /config/.config/chromium-synth — matches SyntH)
 RUN mkdir -p '/config/.config/chromium-synth' && \
     chown -R abc:abc /config && \

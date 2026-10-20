@@ -23,6 +23,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
@@ -88,6 +89,32 @@ _BROWSER_ACCESS_LOCK = asyncio.Lock()
 
 def _profile_dir_default() -> str:
     return os.getenv("CHROMIUM_PROFILE_DIR", "/config/.config/chromium-synth")
+
+
+# Merged into <profile>/Default/Preferences before every launch, see
+# ZendriverLLMBase._ensure_profile_preferences for the reasons.
+_FORCED_PROFILE_PREFERENCES: dict[str, dict[str, Any]] = {
+    "profile": {"exit_type": "Normal", "exited_cleanly": True},
+    "signin": {"allowed": False},
+}
+
+# Chromium's own diagnostics for the account/cookie subsystems, written next to
+# the application log. Verbose logging for these modules is cheap and invisible
+# to websites; it is what shows *why* a login vanished across a restart.
+_CHROMIUM_LOG_NAME = "chromium.log"
+_CHROMIUM_LOG_MAX_BYTES = 5 * 1024 * 1024
+_CHROMIUM_VMODULE = ",".join(
+    f"{name}=2"
+    for name in (
+        "account_reconcilor",
+        "gaia_cookie_manager_service",
+        "dice_response_handler",
+        "dice_account_reconcilor_delegate",
+        "account_consistency_mode_manager",
+        "primary_account_manager",
+        "chrome_signin_client",
+    )
+)
 
 
 def _browser_pid(browser: zd.Browser) -> Optional[int]:
@@ -604,14 +631,43 @@ class ZendriverLLMBase:
         args.append("about:blank")
         return args
 
+    def _open_chromium_log(self) -> Optional[Any]:
+        """Open (append) Chromium's stderr log, keeping the previous one when it gets big."""
+        log_dir = Path(os.getenv("ZEN_LOG_DIR", "./logs"))
+        path = log_dir / _CHROMIUM_LOG_NAME
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > _CHROMIUM_LOG_MAX_BYTES:
+                os.replace(path, log_dir / f"{_CHROMIUM_LOG_NAME}.1")
+            return open(path, "ab")
+        except OSError as exc:
+            logger.warning("[zendriver] Cannot write %s: %s", path, exc)
+            return None
+
     def _spawn_chromium(self, chromium_binary: str, port: int) -> subprocess.Popen[bytes]:
-        logger.info("[zendriver] Launching Chromium: %s %s", chromium_binary, " ".join(self._chromium_args(port)))
-        return subprocess.Popen(
-            [chromium_binary, *self._chromium_args(port)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        args = [
+            *self._chromium_args(port)[:-1],
+            "--enable-logging=stderr",
+            "--v=0",
+            f"--vmodule={_CHROMIUM_VMODULE}",
+            "about:blank",
+        ]
+        logger.info("[zendriver] Launching Chromium: %s %s", chromium_binary, " ".join(args))
+        log_file = self._open_chromium_log()
+        if log_file is not None:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_file.write(f"\n===== {stamp} launch (port {port}) =====\n".encode())
+            log_file.flush()
+        try:
+            return subprocess.Popen(
+                [chromium_binary, *args],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file if log_file is not None else subprocess.DEVNULL,
+            )
+        finally:
+            if log_file is not None:
+                log_file.close()
 
     async def _attach_browser(
         self, proc: subprocess.Popen[bytes], port: int, timeout: float = 30.0
@@ -642,16 +698,24 @@ class ZendriverLLMBase:
             return browser
         raise RuntimeError(f"Could not attach to Chromium on port {port}: {last!r}")
 
-    def _ensure_clean_exit_preference(self) -> None:
-        """Tell Chrome the previous session ended cleanly.
+    def _ensure_profile_preferences(self) -> None:
+        """Write the profile preferences this engine relies on, before Chromium starts.
 
-        Selenium's ``prefs`` experimental option (``profile.exit_type: Normal``,
-        ``profile.exited_cleanly: True``) has no zendriver Config equivalent, so
-        this writes the same two keys directly into
-        ``<profile_dir>/Default/Preferences`` before the browser starts —
-        merging into any existing file rather than clobbering it, since that
-        file also holds real user profile state (extensions, autofill, etc.)
-        once a login has happened.
+        Selenium's ``prefs`` experimental option has no zendriver Config
+        equivalent, so these are merged straight into
+        ``<profile_dir>/Default/Preferences`` -- into any existing file rather
+        than clobbering it, since it also holds real profile state.
+
+        * ``profile.exit_type: Normal`` / ``profile.exited_cleanly: True``: tell
+          Chrome the previous session ended cleanly (no "restore pages" bubble).
+        * ``signin.allowed: False``: browser-level sign-in ("Allow Chromium
+          sign-in" off). A website login is then just cookies, and Chromium's
+          account reconciler never runs. With it on, every restart re-reconciled
+          the web accounts against the browser's own (empty) account list --
+          the web sign-in failed to link ("Missing authorization code due to
+          OAuth outage in Dice" in the profile) and the login was gone right
+          after the relaunch, even after a clean shutdown. Mirrors the
+          ``BrowserSignin=0`` policy shipped in the image.
         """
         try:
             default_dir = os.path.join(self.profile_dir, "Default")
@@ -664,16 +728,16 @@ class ZendriverLLMBase:
                         data = json.load(fh)
                 except Exception:
                     data = {}
-            profile_section = data.get("profile")
-            if not isinstance(profile_section, dict):
-                profile_section = {}
-            profile_section["exit_type"] = "Normal"
-            profile_section["exited_cleanly"] = True
-            data["profile"] = profile_section
+            for section, values in _FORCED_PROFILE_PREFERENCES.items():
+                current = data.get(section)
+                if not isinstance(current, dict):
+                    current = {}
+                current.update(values)
+                data[section] = current
             with open(prefs_path, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
         except Exception as exc:
-            logger.warning("[zendriver] Could not write clean-exit preference: %s", exc)
+            logger.warning("[zendriver] Could not write profile preferences: %s", exc)
 
     def _cleanup_chromium_remnants(self) -> None:
         """Best-effort pre-launch cleanup of stale processes/lock files.
@@ -798,7 +862,7 @@ class ZendriverLLMBase:
 
             logger.info("[zendriver] Initializing browser...")
             await asyncio.to_thread(self._cleanup_chromium_remnants)
-            await asyncio.to_thread(self._ensure_clean_exit_preference)
+            await asyncio.to_thread(self._ensure_profile_preferences)
 
             chromium_binary = self._locate_chromium_binary() or "/usr/bin/chromium"
             await asyncio.to_thread(self._get_chromium_major_version, chromium_binary)  # diagnostics only
