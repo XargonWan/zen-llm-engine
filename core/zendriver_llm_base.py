@@ -577,6 +577,18 @@ class ZendriverLLMBase:
             "this chat window.\n\n"
         )
 
+        # Refusal ward (data-driven, set from the engine JSON by JsonEngine): a web
+        # LLM sometimes answers a perfectly good prompt with a canned refusal
+        # ("I cannot fulfill this request...") that a fresh chat does not repeat.
+        # A reply that STARTS with one of these (case-insensitive) and is at most
+        # ``_refusal_max_chars`` long is retried on a new chat, up to
+        # ``_refusal_retries`` extra times. No markers = ward off (the default).
+        self._refusal_markers: list[str] = []
+        self._refusal_max_chars: int = 600
+        self._refusal_retries: int = 2
+        # Pause before a refusal retry (seconds); a test sets it to 0.
+        self._refusal_retry_pause: float = 2.0
+
         # Wall-clock timestamp when the current shared browser was created —
         # drives the session-hard-timeout watchdog.
         self._driver_start_time: Optional[float] = None
@@ -1255,6 +1267,23 @@ class ZendriverLLMBase:
         msg = str(exc).lower()
         return "could not find node" in msg or "no node" in msg or "object not found" in msg
 
+    def _is_refusal_response(self, text: str) -> bool:
+        """Return True if *text* is a short canned refusal (see ``_refusal_markers``).
+
+        Structural enough to avoid false positives on real answers: the reply must
+        OPEN with a marker and be short (a refusal is a sentence or two), so a long
+        answer that merely mentions a marker is never treated as a refusal. The
+        markers are engine data (``refusal_markers`` in the engine JSON); with none
+        configured this is always False.
+        """
+        if not text or not self._refusal_markers:
+            return False
+        stripped = text.strip()
+        if not stripped or len(stripped) > self._refusal_max_chars:
+            return False
+        lower = stripped.lower().lstrip("\"'`*_ ")
+        return any(lower.startswith(marker.lower()) for marker in self._refusal_markers if marker)
+
     def _is_engine_error_response(self, text: str) -> bool:
         """Return True if *text* looks like an LLM web UI error rather than a valid response."""
         if not text:
@@ -1624,9 +1653,29 @@ class ZendriverLLMBase:
         """Retry wrapper around a single generation attempt."""
         max_attempts = 5
         self._page_refresh_attempts = 0
+        refusals_left = max(0, int(self._refusal_retries)) if self._refusal_markers else 0
+        refusals_seen = 0
         for attempt in range(max_attempts):
             try:
-                return await self._generate_response_once(prompt, media)
+                response = await self._generate_response_once(prompt, media)
+                if self._is_refusal_response(response):
+                    refusals_seen += 1
+                    if refusals_left > 0 and attempt < max_attempts - 1:
+                        refusals_left -= 1
+                        logger.warning(
+                            "[zendriver] Refusal reply %d (%d retr%s left): %r — retrying on a fresh chat",
+                            refusals_seen, refusals_left, "y" if refusals_left == 1 else "ies", response.strip()[:160],
+                        )
+                        self._navigate_on_next_attempt = True
+                        await asyncio.sleep(self._refusal_retry_pause)
+                        continue
+                    logger.warning(
+                        "[zendriver] Refusal reply gave up after %d refusal(s), returning it unchanged: %r",
+                        refusals_seen, response.strip()[:160],
+                    )
+                elif refusals_seen:
+                    logger.info("[zendriver] Retry succeeded after %d refusal(s)", refusals_seen)
+                return response
             except (RuntimeError, asyncio.TimeoutError) as e:
                 if self._is_offsite_redirect_stall(e):
                     logger.warning(

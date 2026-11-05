@@ -55,6 +55,28 @@ logger = logging.getLogger("json_engine")
 _REQUIRED_FIELDS: tuple[str, ...] = ("name", "service_url")
 
 
+# Refusal openings shared by every engine (see ``refusal_markers`` in DEVELOPERS.md).
+_COMMON_REFUSAL_MARKERS_PATH = Path(__file__).with_name("refusal_markers.json")
+
+
+def _load_common_refusal_markers() -> list[str]:
+    """Return the refusal openings every engine inherits (``core/refusal_markers.json``).
+
+    A missing or malformed file only turns the shared list off (logged), it never
+    stops an engine from loading.
+    """
+    try:
+        with _COMMON_REFUSAL_MARKERS_PATH.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.warning("[json_engine] Cannot read %s: %s -- shared refusal markers disabled", _COMMON_REFUSAL_MARKERS_PATH, exc)
+        return []
+    if not isinstance(data, list):
+        logger.warning("[json_engine] %s must hold a JSON list -- shared refusal markers disabled", _COMMON_REFUSAL_MARKERS_PATH)
+        return []
+    return [str(m) for m in data if str(m).strip()]
+
+
 def _load_json(source: Path | dict[str, Any]) -> dict[str, Any]:
     """Accept either a file path or an already-parsed dict."""
     if isinstance(source, dict):
@@ -161,6 +183,20 @@ class JsonEngine(ZendriverLLMBase):
             self._vision_prompt_prefix = str(config["vision_prompt_prefix"])
         if "inline_response_prefix" in config:
             self._inline_response_prefix = str(config["inline_response_prefix"])
+        # Refusal ward (see ZendriverLLMBase._is_refusal_response). Every engine inherits the shared
+        # openings in core/refusal_markers.json; the engine's own "refusal_markers" are added on top, and
+        # "refusal_inherit_common": false opts out of the shared list. "refusal_max_chars" caps how long a
+        # reply may be and still count as a refusal, "refusal_retries" is how many extra fresh chats to try.
+        own_markers = config.get("refusal_markers", [])
+        markers = [str(m) for m in own_markers if str(m).strip()] if isinstance(own_markers, list) else []
+        if config.get("refusal_inherit_common", True):
+            common = _load_common_refusal_markers()
+            markers = common + [m for m in markers if m not in common]
+        self._refusal_markers = markers
+        if "refusal_max_chars" in config:
+            self._refusal_max_chars = max(1, int(config["refusal_max_chars"]))
+        if "refusal_retries" in config:
+            self._refusal_retries = max(0, int(config["refusal_retries"]))
 
         # ------------------------------------------------------------------ media support
         self.media_config: dict[str, Any] = config.get("media_support", {})

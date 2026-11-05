@@ -125,6 +125,21 @@ re-checking the graceful-shutdown rule above — a short interval combined with
 a nuclear reset is what silently logged users out roughly every 5 minutes
 before this was fixed.
 
+## Refusal ward — a canned refusal is retried on a fresh chat
+
+A web LLM's safety layer sometimes refuses a prompt it accepts when asked again (observed 2026-11-04: Synth's background
+profile jobs got "I cannot fulfill this request…" from the Gemini web UI, and the same prompt pasted by hand in a private
+chat was answered normally). `_generate_response_retry_loop` therefore checks each reply with `_is_refusal_response`: it must
+open with one of the engine's refusal markers and be at most `refusal_max_chars` long. The markers are data, never code: every
+engine inherits the shared list in `core/refusal_markers.json` (loaded by `JsonEngine`), plus its own `refusal_markers`;
+`"refusal_inherit_common": false` opts an engine out. So the ward is **on for every engine by default**. On a
+match it sets `_navigate_on_next_attempt` (a new chat, no driver reset) and asks again, up to `refusal_retries` extra times;
+this budget is separate from the loop's `max_attempts`, so a refusal never eats the budget meant for browser failures. After
+the last retry the refusal text is **returned unchanged**, not raised: the caller (Synth) already treats a non-answer as a
+failure and has its own fallback. Look for `Refusal reply … retrying on a fresh chat`, `Retry succeeded after N refusal(s)`
+and `Refusal reply gave up` in the logs. The cost is up to `refusal_retries` extra chats per refused request, including a
+real refusal of a normal chat turn.
+
 ## Failing engines must stop touching the browser (circuit breaker)
 
 Incident (Oct 2026): Gemini was signed out for ~28 hours. Every request failed

@@ -1221,6 +1221,152 @@ def test_is_engine_error_response_ignores_normal_reply_with_number():
     assert engine._is_engine_error_response("Room 404 is down the hall") is False
 
 
+def _refusal_engine(markers=("I cannot fulfill this request", "I must decline"), retries=2, max_chars=600):
+    import tempfile
+
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    engine = ZendriverLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine._refusal_markers = list(markers)
+    engine._refusal_retries = retries
+    engine._refusal_max_chars = max_chars
+    engine._refusal_retry_pause = 0.0
+    return engine
+
+
+def test_is_refusal_response_matches_a_short_reply_that_opens_with_a_marker():
+    engine = _refusal_engine()
+    assert engine._is_refusal_response("I cannot fulfill this request. I am unable to process profile information.") is True
+    assert engine._is_refusal_response("  i CANNOT fulfill this request.") is True, "case and padding do not matter"
+    assert engine._is_refusal_response('"I must decline."') is True, "a quoted reply is still a refusal"
+    assert engine._is_refusal_response("**I must decline** this one.") is True, "markdown emphasis is skipped"
+
+
+def test_is_refusal_response_ignores_real_answers_and_an_unconfigured_ward():
+    engine = _refusal_engine()
+    assert engine._is_refusal_response('{"memories": []}') is False
+    # A marker in the middle is a mention, not a refusal.
+    assert engine._is_refusal_response("The assistant said: I cannot fulfill this request, then explained.") is False
+    # A long, real answer that merely opens with a marker is not retried (the length cap).
+    assert engine._is_refusal_response("I must decline to guess, so here is the full analysis. " + "x" * 700) is False
+    assert engine._is_refusal_response("") is False
+    off = _refusal_engine(markers=())
+    assert off._is_refusal_response("I cannot fulfill this request.") is False, "no markers configured: ward off"
+
+
+def _json_engine_with(**extra):
+    from core.json_engine import JsonEngine
+
+    return JsonEngine(
+        {"name": "my-engine", "service_url": "https://example.com", "models": {"default": 1000}, "default_model": "default", **extra}
+    )
+
+
+def test_json_engine_reads_the_refusal_ward_from_its_config():
+    engine = _json_engine_with(
+        refusal_markers=["Custom opening", "  ", 7, "I must decline"],
+        refusal_max_chars=300,
+        refusal_retries=1,
+    )
+    assert engine._refusal_max_chars == 300 and engine._refusal_retries == 1
+    # Own markers are added to the shared list; blanks are dropped, non-strings stringified.
+    assert "Custom opening" in engine._refusal_markers and "7" in engine._refusal_markers
+    assert "  " not in engine._refusal_markers
+    assert engine._refusal_markers.count("I must decline") == 1, "a marker already shared is not duplicated"
+
+
+def test_every_engine_inherits_the_shared_refusal_markers():
+    import json
+    from pathlib import Path
+
+    shared = json.loads((Path(__file__).resolve().parent.parent / "core" / "refusal_markers.json").read_text(encoding="utf-8"))
+    assert shared and all(isinstance(m, str) and m.strip() for m in shared)
+    plain = _json_engine_with()
+    assert plain._refusal_markers == shared, "an engine that says nothing still gets the shared ward"
+    assert plain._is_refusal_response("I cannot fulfill this request.") is True
+
+
+def test_engine_can_opt_out_of_the_shared_refusal_markers():
+    only_own = _json_engine_with(refusal_inherit_common=False, refusal_markers=["Custom opening"])
+    assert only_own._refusal_markers == ["Custom opening"]
+    off = _json_engine_with(refusal_inherit_common=False)
+    assert off._refusal_markers == [], "opted out and no own markers: ward off"
+
+
+def test_shared_refusal_markers_file_problems_do_not_stop_an_engine_loading(tmp_path, monkeypatch):
+    import core.json_engine as je
+
+    monkeypatch.setattr(je, "_COMMON_REFUSAL_MARKERS_PATH", tmp_path / "missing.json")
+    assert _json_engine_with(refusal_markers=["Custom opening"])._refusal_markers == ["Custom opening"]
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"not": "a list"}', encoding="utf-8")
+    monkeypatch.setattr(je, "_COMMON_REFUSAL_MARKERS_PATH", bad)
+    assert _json_engine_with()._refusal_markers == []
+
+
+def _loop_with_replies(engine, replies):
+    calls = []
+
+    async def fake_once(prompt, media=None):
+        calls.append(prompt)
+        item = replies[min(len(calls) - 1, len(replies) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    engine._generate_response_once = fake_once
+
+    async def fake_reset():
+        engine._reset_called = True
+
+    engine._reset_called = False
+    engine._reset_driver = fake_reset
+    return calls
+
+
+def test_refusal_then_a_real_answer_is_retried_on_a_fresh_chat():
+    engine = _refusal_engine()
+    calls = _loop_with_replies(engine, ["I cannot fulfill this request.", '{"ok": true}'])
+    assert asyncio.run(engine._generate_response_retry_loop("hello")) == '{"ok": true}'
+    assert len(calls) == 2
+    assert engine._navigate_on_next_attempt is True, "the retry must open a new chat"
+    assert engine._reset_called is False, "a refusal is not a browser failure: no driver reset"
+
+
+def test_refusal_every_time_gives_up_after_the_retries_and_returns_it_unchanged():
+    engine = _refusal_engine(retries=2)
+    calls = _loop_with_replies(engine, ["I must decline."])
+    assert asyncio.run(engine._generate_response_retry_loop("hello")) == "I must decline."
+    assert len(calls) == 3, "1 first try + 2 retries, no more"
+
+
+def test_the_ward_is_off_with_zero_retries_or_no_markers():
+    zero = _refusal_engine(retries=0)
+    calls = _loop_with_replies(zero, ["I must decline."])
+    assert asyncio.run(zero._generate_response_retry_loop("hello")) == "I must decline."
+    assert len(calls) == 1
+    none = _refusal_engine(markers=())
+    calls = _loop_with_replies(none, ["I must decline."])
+    assert asyncio.run(none._generate_response_retry_loop("hello")) == "I must decline."
+    assert len(calls) == 1
+
+
+def test_a_refusal_does_not_use_up_the_browser_failure_budget():
+    engine = _refusal_engine(retries=1)
+    calls = _loop_with_replies(
+        engine,
+        ["I must decline.", RuntimeError("redirect-stall: send not accepted after redirect"),
+         RuntimeError("redirect-stall: send not accepted after redirect"), "a real answer"],
+    )
+    assert asyncio.run(engine._generate_response_retry_loop("hello")) == "a real answer"
+    assert len(calls) == 4
+
+
 def test_check_login_state_no_browser_launch_when_uninitialized():
     from core.zendriver_llm_base import ZendriverLLMBase
 

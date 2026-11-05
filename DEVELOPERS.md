@@ -81,6 +81,10 @@ Only `name` and `service_url` are required; everything else is optional.
 | `aliases` | string[] | no | Alternative names for `GET /engine/<alias>/prompt`. |
 | `default_model` | string | no | Model slug used when logged in. Should also appear in `models`. |
 | `allow_unlogged` | boolean | no | If true and `models` includes `unlogged`, `get_current_model()` returns `unlogged` when not logged in. |
+| `refusal_markers` | string[] | no | Refusal ward. Extra openings of this service's canned refusals, **added to** the list every engine already inherits from `core/refusal_markers.json` (the shared place to add a marker that applies to all engines). A reply that STARTS with a marker (case-insensitive, leading quotes/`*`/`_` ignored) and is at most `refusal_max_chars` long is retried on a fresh chat. The match is data, never code: `core/` names no engine. |
+| `refusal_inherit_common` | boolean | no | Default `true`. `false` = ignore `core/refusal_markers.json` and use only this engine's own `refusal_markers` (none = ward off). |
+| `refusal_max_chars` | integer | no | Longest reply (characters) that still counts as a refusal. Default `600`; a long, real answer that merely opens with a marker is never retried. |
+| `refusal_retries` | integer | no | Extra fresh-chat attempts per refused request, separate from the loop's browser-failure budget. Default `2`; `0` turns the ward off. After the last one the refusal text is returned unchanged. |
 
 #### `models`
 
@@ -301,5 +305,6 @@ Constraints when extending this:
 - [ ] `name` / `ENGINE_NAME` matches the filename slug.
 - [ ] At least one selector in each `selectors.*` list.
 - [ ] `"unlogged"` model entry present in `models` and `"allow_unlogged": true` if the site allows unauthenticated use.
+- [ ] If the service sometimes refuses at random (a web LLM's safety layer): the shared openings in `core/refusal_markers.json` already apply; add only service-specific ones to `refusal_markers` (see the table) instead of adding code.
 - [ ] Tested with `POST /api/engines/reload` and a real prompt (or mock test).
 - [ ] PR description mentions which site was tested and Chromium version used.
