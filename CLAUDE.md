@@ -260,6 +260,24 @@ connection dropped without a proper WS close handshake) is now in
 the same dead connection and failing in ~1ms instead of the browser ever
 getting recreated.
 
+## Unanswered CDP commands (wedged browser)
+
+zendriver's `Connection.send` awaits its reply with no timeout, so a renderer
+that stops answering used to park the request until the 480 s `total_timeout`
+and then force-reset the browser (observed live: ~19% of requests).
+`_guard_send` wraps it (installed at import in `core/zendriver_llm_base.py`;
+the metaclass forbids plain assignment, hence `type.__setattr__`): after
+`ZEN_CDP_COMMAND_TIMEOUT` seconds (default 45, `0` disables) the command raises
+`CdpWedgedError`, and every later command fails fast until the next
+`_init_browser` clears the flag.
+
+- The retry loop answers `CdpWedgedError` with the *graceful* `_reset_driver()`
+  and a retry on a fresh chat; it does not grow the prompt chunk count.
+- **Polling loops must call `raise_if_cdp_wedged()`** each iteration, because
+  the helpers around them deliberately swallow exceptions into "not found".
+- `CdpWedgedError` carries the `selenium_response_detection_timeout` marker so
+  existing callers still classify it as a response-detection timeout.
+
 ## Resetting a stuck session
 
 Three different levers, in order of how much they cost:

@@ -10,6 +10,7 @@ worker thread pool is used anywhere in the request path.
 from __future__ import annotations
 
 import asyncio
+import functools
 import glob
 import json
 import logging
@@ -171,6 +172,88 @@ def _kill_process_tree(pid: int) -> None:
     # calls wait() on a SIGKILLed one, so without this it stays a zombie
     # forever -- 167 of them were found after a few days of resets.
     proc_utils.reap_pid(pid, timeout=2.0)
+
+
+class CdpWedgedError(RuntimeError):
+    """A CDP command got no reply: the browser or its websocket is wedged.
+
+    Carries the ``selenium_response_detection_timeout`` marker so existing
+    callers keep classifying it as a response-detection timeout.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(f"selenium_response_detection_timeout: CDP wedged: {detail}")
+
+
+# Set once a CDP command times out; every later command fails fast until a new
+# browser is created, so the polling loops stop at their next check instead of
+# each waiting out its own timeout on a browser that will not answer.
+_cdp_wedged_reason: Optional[str] = None
+
+
+def _cdp_command_timeout() -> float:
+    try:
+        return float(os.getenv("ZEN_CDP_COMMAND_TIMEOUT", "45"))
+    except ValueError:
+        return 45.0
+
+
+def _clear_cdp_wedge() -> None:
+    global _cdp_wedged_reason
+    _cdp_wedged_reason = None
+
+
+def raise_if_cdp_wedged() -> None:
+    if _cdp_wedged_reason is not None:
+        raise CdpWedgedError(_cdp_wedged_reason)
+
+
+def _guard_send(original: Any) -> Any:
+    """Wrap ``Connection.send`` so an unanswered command cannot wait forever.
+
+    zendriver awaits the reply transaction with no timeout, so a renderer that
+    stops answering parks the caller until the outer ``total_timeout`` (480 s)
+    kills the whole request and force-resets the browser. Observed: ~19% of
+    requests, with no log line between the send and the reset.
+    """
+
+    @functools.wraps(original)
+    async def guarded_send(self: Any, cdp_obj: Any, _is_update: bool = False) -> Any:
+        global _cdp_wedged_reason
+        raise_if_cdp_wedged()
+        timeout = _cdp_command_timeout()
+        if timeout <= 0:
+            return await original(self, cdp_obj, _is_update)
+        task = asyncio.ensure_future(original(self, cdp_obj, _is_update))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not done:
+            task.cancel()
+            command = getattr(cdp_obj, "__qualname__", "command")
+            _cdp_wedged_reason = f"{command} got no reply within {timeout:g}s"
+            logger.error("[zendriver] %s", _cdp_wedged_reason)
+            raise CdpWedgedError(_cdp_wedged_reason)
+        return task.result()
+
+    guarded_send._zen_guarded = True  # type: ignore[attr-defined]
+    return guarded_send
+
+
+def _install_cdp_command_guard() -> None:
+    from zendriver.core.connection import Connection
+
+    if not getattr(Connection.send, "_zen_guarded", False):
+        # Connection's metaclass (CantTouchThis) refuses ``Connection.send = ...``
+        # so nobody mutates shared state by accident. Sharing is exactly the
+        # point here: every Browser/Tab connection must go through the guard,
+        # and no zendriver subclass overrides ``send``.
+        type.__setattr__(Connection, "send", _guard_send(Connection.send))
+
+
+_install_cdp_command_guard()
 
 
 async def _dispose_browser(browser: Optional[zd.Browser]) -> None:
@@ -861,6 +944,7 @@ class ZendriverLLMBase:
                 _shared_browser = None
 
             logger.info("[zendriver] Initializing browser...")
+            _clear_cdp_wedge()
             await asyncio.to_thread(self._cleanup_chromium_remnants)
             await asyncio.to_thread(self._ensure_profile_preferences)
 
@@ -1362,6 +1446,7 @@ class ZendriverLLMBase:
         remaining = max(5.0, deadline - time.time())
         poll_end = time.time() + remaining
         while time.time() < poll_end:
+            raise_if_cdp_wedged()
             for sel in self.prompt_area_selectors:
                 els = await self._query_all(tab, sel)
                 if els:
@@ -1552,6 +1637,21 @@ class ZendriverLLMBase:
 
                 if isinstance(e, LoginRequiredError):
                     raise
+
+                if isinstance(e, CdpWedgedError):
+                    # The browser stopped answering. Resetting it (graceful stop
+                    # with a bounded timeout, then kill + reap) beats waiting on
+                    # the same wedged page, and a wedge says nothing about the
+                    # prompt size, so it must not grow the chunk count either.
+                    if attempt >= max_attempts - 1:
+                        raise
+                    logger.warning(
+                        "[zendriver] CDP wedged on attempt %d/%d: %s — resetting browser and retrying",
+                        attempt + 1, max_attempts, e,
+                    )
+                    self._navigate_on_next_attempt = True
+                    await self._reset_driver()
+                    continue
 
                 # A failed attempt on a page that visibly asks to sign in is a
                 # login problem, not a flaky page: resetting the browser and
@@ -1806,6 +1906,8 @@ class ZendriverLLMBase:
                 return response
 
             except Exception as e:
+                if isinstance(e, CdpWedgedError):
+                    raise
                 if self._is_stale_element_error(e):
                     stale_retries += 1
                     self._cached_prompt_selector = None
@@ -2325,11 +2427,12 @@ class ZendriverLLMBase:
 
         deadline = time.time() + timeout
         while time.time() < deadline:
+            raise_if_cdp_wedged()
             for sel in ordered:
                 try:
                     els = await tab.query_selector_all(sel)
                 except Exception as e:
-                    if self._is_dead_session(e):
+                    if isinstance(e, CdpWedgedError) or self._is_dead_session(e):
                         raise
                     continue
                 for el in els:
@@ -2768,6 +2871,7 @@ class ZendriverLLMBase:
         timeout = float(os.getenv("SELENIUM_POST_SEND_TIMEOUT", str(timeout)))
         deadline = time.time() + timeout
         while time.time() < deadline:
+            raise_if_cdp_wedged()
             if await self._stop_button_present(tab):
                 logger.debug("[zendriver] post_send_check: stop button visible — send accepted")
                 return True
@@ -2846,6 +2950,7 @@ class ZendriverLLMBase:
         hard_cap = max_wait + max(30, int(max_wait * 0.5))
 
         while time.time() < deadline and (time.time() - wait_start) < hard_cap:
+            raise_if_cdp_wedged()
             iteration += 1
             container, selector = await self._find_response_container_element(tab)
             if container is None:
