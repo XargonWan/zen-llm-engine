@@ -315,7 +315,6 @@ class _PromptJob:
     future: asyncio.Future  # type: ignore[type-arg]
     media: list[Any] = field(default_factory=list)
     timeout: int | None = None
-    agent_mode: bool = False
 
 
 def _env_int(name: str, default: int) -> int:
@@ -830,7 +829,6 @@ class EngineManager:
                 try:
                     result_text = await engine.generate_response(
                         job.prompt, job.media, timeout=job.timeout,
-                        agent_mode=job.agent_mode,
                     )
                 except TypeError:
                     try:
@@ -870,7 +868,6 @@ class EngineManager:
         prompt: str,
         media: list[Any] | None = None,
         timeout: int | None = None,
-        agent_mode: bool = False,
     ) -> _PromptResult:
         """Submit *prompt* and optional media to the named engine's FIFO queue.
 
@@ -894,7 +891,6 @@ class EngineManager:
         future: asyncio.Future[_PromptResult] = loop.create_future()
         job = _PromptJob(
             prompt=prompt, future=future, media=media or [], timeout=timeout,
-            agent_mode=agent_mode,
         )
         job._queued_at = _time.time()  # type: ignore[attr-defined]
         self._ensure_workers(canonical)

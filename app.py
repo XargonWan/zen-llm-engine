@@ -39,15 +39,6 @@ from db.db import (
     inc_requests,
     inc_responses,
 )
-from core.agent_protocol import (
-    build_agent_system_prompt,
-    build_agent_turn_reminder,
-    build_reformulation_prompt,
-    detect_agent_context,
-    needs_reformulation,
-    parse_agent_response,
-    to_openai_tool_calls,
-)
 from core.engine_manager import EngineManager
 from core.errors import EngineUnavailableError
 from core import debug_mode, proc_utils
@@ -488,26 +479,11 @@ def _openai_response(
     prompt: str,
     response_text: str,
     elapsed_ms: int,
-    agent_parsed: Any = None,
 ) -> Dict[str, Any]:
     prompt_tokens = _estimate_tokens(prompt)
     completion_tokens = _estimate_tokens(response_text)
-
-    # Agent mode: emit OpenAI tool_calls when the model requested tool use.
-    if agent_parsed is not None and getattr(agent_parsed, "tool_calls", None):
-        message: Dict[str, Any] = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": to_openai_tool_calls(agent_parsed.tool_calls),
-        }
-        finish_reason = "tool_calls"
-    else:
-        # Prefer parsed final content when available, else the raw scraped text.
-        content = response_text
-        if agent_parsed is not None and getattr(agent_parsed, "content", None):
-            content = agent_parsed.content
-        message = {"role": "assistant", "content": content}
-        finish_reason = "stop"
+    message: Dict[str, Any] = {"role": "assistant", "content": response_text}
+    finish_reason = "stop"
 
     return {
         "id": f"llm_{int(time.time())}",
@@ -537,18 +513,10 @@ def _openai_chunk(
     model_name: str,
     content: str,
     finish_reason: Any,
-    tool_calls: Any = None,
 ) -> str:
-    """Format a single SSE chunk in OpenAI chat.completion.chunk format.
-
-    When *tool_calls* is provided (agent mode), it is emitted in the delta
-    instead of textual content so streaming clients receive structured tool
-    calls exactly like the non-streaming path.
-    """
-    if tool_calls:
-        delta: Dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
-    elif content:
-        delta = {"role": "assistant", "content": content}
+    """Format a single SSE chunk in OpenAI chat.completion.chunk format."""
+    if content:
+        delta: Dict[str, Any] = {"role": "assistant", "content": content}
     else:
         delta = {}
     payload = {
@@ -964,18 +932,9 @@ async def openai_chat(req: Request) -> Any:
 
     stream = bool(data.get("stream", False))
 
-    # Detect the agentic (tool-calling) lane from OpenAI agentic fields.
-    agent_ctx = detect_agent_context(data)
-    if agent_ctx is not None:
-        logger.info(
-            "[agent] Agentic request detected (tools=%d, response_format=%s)",
-            len(agent_ctx.get("tools") or []),
-            bool(agent_ctx.get("response_format")),
-        )
-
     return await _prompt(
         engine, req, explicit_prompt=prompt_payload, model_name=model, stream=stream,
-        timeout=data.get("timeout"), agent_ctx=agent_ctx,
+        timeout=data.get("timeout"),
     )
 
 
@@ -992,7 +951,6 @@ async def _prompt(
     model_name: str = "default",
     stream: bool = False,
     timeout: int | None = None,
-    agent_ctx: Dict[str, Any] | None = None,
 ) -> Any:
     if RESET_IN_PROGRESS:
         raise HTTPException(
@@ -1023,23 +981,6 @@ async def _prompt(
     if not isinstance(prompt_text, str):
         prompt_text = str(prompt_text)
 
-    # Agent mode: prepend the tool-calling harness so the browser-driven model
-    # replies with parseable JSON. The scraped reply is parsed below with a
-    # bounded reformulation retry.
-    agent_mode = agent_ctx is not None
-    has_tools = False
-    if agent_mode:
-        # Prepend the full harness AND append a short in-character reminder so
-        # the roleplay contract is both the first and the LAST thing the model
-        # reads — on long multi-turn histories the leading harness alone drifts
-        # out of context and the model reverts to a plain "safe assistant".
-        has_tools = bool(agent_ctx.get("tools"))
-        prompt_text = (
-            build_agent_system_prompt(agent_ctx)
-            + prompt_text
-            + build_agent_turn_reminder(has_tools, agent_ctx.get("tools"))
-        )
-
     current_task = asyncio.current_task()
     if current_task is not None:
         _register_task(current_task)
@@ -1051,7 +992,6 @@ async def _prompt(
         engine_name,
         model=model_name,
         stream=stream,
-        agent_mode=agent_mode,
         media_count=len(media_items),
         prompt=prompt_text,
     )
@@ -1066,7 +1006,7 @@ async def _prompt(
                     # SSE heartbeats while waiting, keeping the connection alive.
                     result_future = asyncio.ensure_future(
                         mgr.enqueue(engine_name, prompt_text, media_items,
-                                    timeout=timeout, agent_mode=agent_mode)
+                                    timeout=timeout)
                     )
 
                     heartbeat_interval = 5.0  # seconds
@@ -1081,37 +1021,6 @@ async def _prompt(
                             yield ": heartbeat\n\n"
 
                     result_obj = result_future.result()
-
-                    # Agent mode over SSE: apply the SAME parse + bounded
-                    # reformulation as the non-streaming path, otherwise the
-                    # scraped JSON (e.g. a bare {"content": "..."} promise or a
-                    # tool call) would be streamed back as raw text and the
-                    # client would never receive structured tool_calls.
-                    agent_parsed = None
-                    if agent_mode:
-                        agent_parsed = parse_agent_response(result_obj.text)
-                        max_reformulations = 2
-                        attempts = 0
-                        while (
-                            needs_reformulation(agent_parsed, has_tools=has_tools)
-                            and attempts < max_reformulations
-                        ):
-                            attempts += 1
-                            logger.warning(
-                                "[agent] Stream reply needs reformulation, "
-                                "attempt %d/%d",
-                                attempts,
-                                max_reformulations,
-                            )
-                            retry_obj = await mgr.enqueue(
-                                engine_name,
-                                build_reformulation_prompt(prompt_text),
-                                media_items,
-                                timeout=timeout,
-                                agent_mode=True,
-                            )
-                            result_obj = retry_obj
-                            agent_parsed = parse_agent_response(result_obj.text)
 
                     elapsed_ms = int((time.time() - start) * 1000)
                     if media_items:
@@ -1134,32 +1043,12 @@ async def _prompt(
                     )
                     inc_responses()
                     chunk_id = f"llm_{int(time.time())}"
-                    if agent_parsed is not None and agent_parsed.tool_calls:
-                        # Emit structured tool calls, then close with the
-                        # OpenAI-mandated "tool_calls" finish reason.
-                        yield _openai_chunk(
-                            chunk_id,
-                            result_obj.model_name,
-                            "",
-                            None,
-                            tool_calls=to_openai_tool_calls(agent_parsed.tool_calls),
-                        )
-                        yield _openai_chunk(
-                            chunk_id, result_obj.model_name, "", "tool_calls"
-                        )
-                    else:
-                        # Final textual answer: prefer the parsed content over
-                        # the raw scraped text so the client never sees the
-                        # JSON wrapper.
-                        out_text = result_obj.text
-                        if agent_parsed is not None and agent_parsed.content:
-                            out_text = agent_parsed.content
-                        yield _openai_chunk(
-                            chunk_id, result_obj.model_name, out_text, None
-                        )
-                        yield _openai_chunk(
-                            chunk_id, result_obj.model_name, "", "stop"
-                        )
+                    yield _openai_chunk(
+                        chunk_id, result_obj.model_name, result_obj.text, None
+                    )
+                    yield _openai_chunk(
+                        chunk_id, result_obj.model_name, "", "stop"
+                    )
                     yield "data: [DONE]\n\n"
                 except Exception as e:
                     if isinstance(e, EngineUnavailableError):
@@ -1182,35 +1071,7 @@ async def _prompt(
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
         result_obj = await mgr.enqueue(engine_name, prompt_text, media_items,
-                                        timeout=timeout, agent_mode=agent_mode)
-
-        agent_parsed = None
-        if agent_mode:
-            agent_parsed = parse_agent_response(result_obj.text)
-            # Bounded reformulation retries when the reply is not parseable —
-            # or when the model returned a valid {"content": ...} that is really
-            # an out-of-character refusal to use the available tools.
-            max_reformulations = 2
-            attempts = 0
-            while (
-                needs_reformulation(agent_parsed, has_tools=has_tools)
-                and attempts < max_reformulations
-            ):
-                attempts += 1
-                logger.warning(
-                    "[agent] Unparseable reply, reformulation attempt %d/%d",
-                    attempts,
-                    max_reformulations,
-                )
-                # Stateless engines refresh the page between turns, so re-send
-                # the full harness + original request (not a bare nudge) to keep
-                # the tool list and task in context on every retry.
-                retry_obj = await mgr.enqueue(
-                    engine_name, build_reformulation_prompt(prompt_text), media_items,
-                    timeout=timeout, agent_mode=True,
-                )
-                result_obj = retry_obj
-                agent_parsed = parse_agent_response(result_obj.text)
+                                        timeout=timeout)
 
         duration_ms = int((time.time() - start) * 1000)
         if media_items:
@@ -1239,7 +1100,6 @@ async def _prompt(
             prompt_text,
             result_obj.text,
             duration_ms,
-            agent_parsed=agent_parsed,
         )
 
     except asyncio.CancelledError:

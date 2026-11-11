@@ -31,7 +31,7 @@ from urllib.parse import urlparse
 import zendriver as zd
 from zendriver.core.keys import KeyEvents, KeyModifiers, SpecialKeys
 
-from core.agent_protocol import AGENT_TAIL_MARKER
+from core.terminal_mode import AGENT_TAIL_MARKER
 from core import debug_mode, proc_utils
 from core.errors import LoginRequiredError
 
@@ -515,11 +515,6 @@ class ZendriverLLMBase:
         # generating (slow thinking model) we skip the reset; if the stop-button
         # was never seen (stuck/dead session) we reset as before.
         self._generation_was_active: bool = False
-
-        # Set per-request by generate_response(): when True the request is part
-        # of the agentic (tool-calling) lane and short JSON replies must not be
-        # discarded by the page-state junk filter.
-        self._agent_mode: bool = False
 
         # Per-engine total timeout override (seconds). Set by JsonEngine from
         # the JSON config key "total_timeout". None means use the computed default.
@@ -1130,7 +1125,6 @@ class ZendriverLLMBase:
 
     async def generate_response(
         self, prompt: str, media: list[Any] | None = None, timeout: int | None = None,
-        agent_mode: bool = False,
     ) -> str:
         """Send prompt and optional media to the LLM service and return the response text.
 
@@ -1141,12 +1135,7 @@ class ZendriverLLMBase:
             (navigation + input + response). ``None`` uses the default of
             300 s (5 min), overridable via the ``SELENIUM_TOTAL_TIMEOUT``
             environment variable.
-        agent_mode:
-            When True the request is part of the agentic (tool-calling) lane.
-            Structured JSON replies must NOT be discarded as page-state junk,
-            so ``_looks_like_response_text_junk`` is relaxed for this request.
         """
-        self._agent_mode = bool(agent_mode)
         if timeout is not None:
             total_timeout = int(timeout)
         elif self._total_timeout is not None:
@@ -2285,7 +2274,7 @@ class ZendriverLLMBase:
         if len(stripped) > 300:
             return False
 
-        if not self._agent_mode and (stripped.startswith("{") or stripped.startswith("[")):
+        if (stripped.startswith("{") or stripped.startswith("[")):
             try:
                 json.loads(stripped)
                 logger.debug("[zendriver] _looks_like_response_text_junk: rejected JSON-like text")
