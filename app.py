@@ -42,6 +42,7 @@ from db.db import (
 from core.engine_manager import EngineManager
 from core.errors import EngineUnavailableError
 from core import debug_mode, proc_utils
+from core.terminal_mode import build_terminal_prompt, is_terminal_mode
 from core.zendriver_llm_base import get_browser_stats
 from core.models import (
     ChatCompletion,
@@ -252,7 +253,9 @@ def _extract_text_and_media(content: Any, media_items: list[MediaItem]) -> str:
     return str(content)
 
 
-def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
+def _normalize_prompt_payload(
+    payload: Any, label_system: bool = True
+) -> tuple[str, list[MediaItem]]:
     prompt_text = ""
     media_items: list[MediaItem] = []
 
@@ -280,7 +283,10 @@ def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
 
         parts: list[str] = []
         if system_parts:
-            parts.append("[INSTRUCTIONS]:\n" + "\n\n".join(system_parts))
+            joined_system = "\n\n".join(system_parts)
+            parts.append(
+                "[INSTRUCTIONS]:\n" + joined_system if label_system else joined_system
+            )
         if user_parts:
             parts.extend(user_parts)
         prompt_text = "\n\n".join(parts)
@@ -803,6 +809,7 @@ async def engine_prompt(engine_name: str, req: Request) -> Any:
         model_name=data.get("model", canonical),
         stream=bool(data.get("stream", False)),
         timeout=data.get("timeout"),
+        mode=data.get("mode"),
     )
 
 
@@ -934,7 +941,7 @@ async def openai_chat(req: Request) -> Any:
 
     return await _prompt(
         engine, req, explicit_prompt=prompt_payload, model_name=model, stream=stream,
-        timeout=data.get("timeout"),
+        timeout=data.get("timeout"), mode=data.get("mode"),
     )
 
 
@@ -951,6 +958,7 @@ async def _prompt(
     model_name: str = "default",
     stream: bool = False,
     timeout: int | None = None,
+    mode: Any = None,
 ) -> Any:
     if RESET_IN_PROGRESS:
         raise HTTPException(
@@ -968,18 +976,30 @@ async def _prompt(
     if explicit_prompt is None:
         payload = await _safe_parse_json(req)
         prompt_payload = payload.get("prompt") or payload.get("messages")
+        mode = payload.get("mode", mode)
     else:
         prompt_payload = explicit_prompt
 
     if prompt_payload is None:
         raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
-    prompt_text, media_items = _normalize_prompt_payload(prompt_payload)
+    terminal = is_terminal_mode(mode)
+    prompt_text, media_items = _normalize_prompt_payload(
+        prompt_payload, label_system=not terminal
+    )
     if not prompt_text and not media_items:
         raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
     if not isinstance(prompt_text, str):
         prompt_text = str(prompt_text)
+
+    # Terminal mode: present the exchange as a plain shell session (see
+    # core/terminal_mode.py). The reply is returned untouched; interpreting it
+    # is the caller's job. This replaced a JSON tool-call harness: it was removed
+    # in commit 35901f0 and is kept on branch backup/json-agent-lane (find it with
+    # `git log --diff-filter=D -- core/agent_protocol.py`).
+    if terminal:
+        prompt_text = build_terminal_prompt(prompt_text)
 
     current_task = asyncio.current_task()
     if current_task is not None:

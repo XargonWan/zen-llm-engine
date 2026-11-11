@@ -4089,3 +4089,60 @@ def test_fill_input_still_types_short_plain_text(monkeypatch):
 
     typed = [c.args[0] for c in element.send_keys.await_args_list if c.args]
     assert "hello world" in typed
+
+
+# ---------------------------------------------------------------------------
+# Terminal mode — /v1/chat/completions with "mode": "terminal"
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_mode_frames_the_prompt_and_returns_the_reply_untouched():
+    from core.terminal_mode import AGENT_TAIL_MARKER
+
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = "lsblk -o NAME,SIZE"
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "mode": "terminal",
+            "messages": [
+                {"role": "system", "content": "Find the USB stick."},
+                {"role": "user", "content": "$ lsblk\nsda 14G"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "lsblk -o NAME,SIZE"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert not body["choices"][0]["message"].get("tool_calls")
+    assert engine.last_prompt.startswith("Find the USB stick.")
+    assert "[INSTRUCTIONS]" not in engine.last_prompt
+    assert AGENT_TAIL_MARKER in engine.last_prompt
+    assert engine.last_prompt.rstrip().endswith("----END----")
+
+
+def test_without_terminal_mode_the_prompt_is_not_framed():
+    engine = EngineManager.get().engines["chatgpt"]
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "chatgpt",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200
+    assert "Operating system" not in engine.last_prompt
+    assert "----END----" not in engine.last_prompt
+
+
+def test_terminal_mode_on_the_engine_prompt_route():
+    engine = EngineManager.get().engines["chatgpt"]
+    response = client.post(
+        "/engine/chatgpt/prompt",
+        json={"prompt": "list the disks", "mode": "terminal"},
+    )
+    assert response.status_code == 200
+    assert engine.last_prompt.startswith("list the disks")
+    assert "Language: bash" in engine.last_prompt
