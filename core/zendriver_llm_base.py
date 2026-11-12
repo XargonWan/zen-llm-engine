@@ -2679,9 +2679,22 @@ class ZendriverLLMBase:
                         # Some frameworks distinguish programmatic updates from user key
                         # events. Trigger a whitespace keypress + backspace to force UI
                         # internals to re-evaluate and enable the send button.
+                        #
+                        # The BACKSPACE only undoes a space that really landed. On a
+                        # large prompt the editor can drop the SPACE (it is busy
+                        # re-rendering the insert); an unconditional BACKSPACE then
+                        # deleted the prompt's own last character, so the page held
+                        # "...}]" for "...}]}" and fill_input failed verification
+                        # (live: expected 31978 chars, got 31977, 15 times in 3 hours).
                         try:
+                            before_nudge = await self._get_input_text(element)
                             await element.send_keys(SpecialKeys.SPACE)
-                            await element.send_keys(SpecialKeys.BACKSPACE)
+                            await asyncio.sleep(0.05)
+                            after_nudge = await self._get_input_text(element)
+                            if len(after_nudge) > len(before_nudge):
+                                await element.send_keys(SpecialKeys.BACKSPACE)
+                            else:
+                                logger.debug("[zendriver] fill_input nudge: the space did not land, not sending BACKSPACE")
                         except Exception:
                             pass
 
@@ -2946,6 +2959,28 @@ class ZendriverLLMBase:
             return ""
         return text if isinstance(text, str) else ""
 
+    @staticmethod
+    def _stop_visible_stable_polls(silent_freeze_threshold: float) -> int:
+        """Polls the text must stay unchanged, with the stop button visible, to count as final.
+
+        One poll is about a second. A little under the silent-freeze threshold, so
+        a UI that really is stuck after completion still returns its text here
+        before the freeze handling would refresh the page.
+        """
+        try:
+            return max(2, int(float(silent_freeze_threshold)) - 2)
+        except (TypeError, ValueError):
+            return 8
+
+    @staticmethod
+    def _stable_text_is_final(stop_visible: bool, stable_counter: int, stop_visible_stable_polls: int) -> bool:
+        """Whether text that has stopped changing can be returned as the full reply."""
+        if stable_counter < 2:
+            return False
+        if not stop_visible:
+            return True
+        return stable_counter >= stop_visible_stable_polls
+
     async def _wait_for_response(self, tab: zd.Tab, max_wait: int = 120, pre_send_text: str | None = None) -> str:
         """Wait for the LLM response to fully stream, then return its text.
 
@@ -2955,7 +2990,11 @@ class ZendriverLLMBase:
         3. Track innerText length and childElementCount.
         4. If either metric changes, generation is still in progress.
         5. If both remain unchanged for 2 consecutive checks after activity starts,
-           assume generation has finished.
+           assume generation has finished -- but only when the stop button is
+           gone. While it is still visible the model may just be pausing
+           mid-stream, so the text must stay unchanged for
+           ``_stop_visible_stable_polls`` checks (a little under the silent-freeze
+           threshold) before it is accepted; accepting at 2 returned half a reply.
         """
         await self._click_accept_buttons(tab, timeout=2.0)
 
@@ -2987,9 +3026,15 @@ class ZendriverLLMBase:
 
         hard_cap = max_wait + max(30, int(max_wait * 0.5))
 
+        silent_freeze_threshold = self._silent_freeze_threshold
+        if silent_freeze_threshold is None:
+            silent_freeze_threshold = float(os.getenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10"))
+        stop_visible_stable_polls = self._stop_visible_stable_polls(silent_freeze_threshold)
+
         while time.time() < deadline and (time.time() - wait_start) < hard_cap:
             raise_if_cdp_wedged()
             iteration += 1
+            stop_visible: bool | None = None
             container, selector = await self._find_response_container_element(tab)
             if container is None:
                 logger.debug("[zendriver] watcher iteration=%d no response container element found", iteration)
@@ -3017,25 +3062,38 @@ class ZendriverLLMBase:
                 previous_child_count = current_child_count
 
                 if stable_counter >= 2:
-                    response = await self._extract_response_text_from_element(container)
-                    if (
-                        response and pre_send_text and not self._generation_was_active
-                        and response.strip() == pre_send_text.strip()
-                    ):
-                        raise RuntimeError(
-                            "Stale response: the text is unchanged from before the "
-                            "prompt was sent and no generation activity was observed"
+                    stop_visible = await self._stop_button_present(tab)
+                    if self._stable_text_is_final(stop_visible, stable_counter, stop_visible_stable_polls):
+                        response = await self._extract_response_text_from_element(container)
+                        if (
+                            response and pre_send_text and not self._generation_was_active
+                            and response.strip() == pre_send_text.strip()
+                        ):
+                            raise RuntimeError(
+                                "Stale response: the text is unchanged from before the "
+                                "prompt was sent and no generation activity was observed"
+                            )
+                        if response:
+                            logger.debug("[zendriver] watcher detected stable response after %d iterations", iteration)
+                            return response
+                    else:
+                        logger.debug(
+                            "[zendriver] text stable for %d checks but the stop button is still visible; "
+                            "waiting for %d before accepting it",
+                            stable_counter, stop_visible_stable_polls,
                         )
-                    if response:
-                        logger.debug("[zendriver] watcher detected stable response after %d iterations", iteration)
-                        return response
 
-            silent_freeze_threshold = self._silent_freeze_threshold
-            if silent_freeze_threshold is None:
-                silent_freeze_threshold = float(os.getenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10"))
-            stop_visible = await self._stop_button_present(tab)
+            if stop_visible is None:
+                stop_visible = await self._stop_button_present(tab)
             is_silent_freeze = stop_visible and (time.time() - last_activity_time) > silent_freeze_threshold
-            is_ui_stuck = stop_visible and stable_counter >= 2 and (current_text_length > 0 or current_child_count > 0)
+            # The same longer stability applies here: a model pausing mid-stream must
+            # not be mistaken for a finished-but-stuck UI (a page refresh throws the
+            # partial reply away and regenerates it).
+            is_ui_stuck = (
+                stop_visible
+                and stable_counter >= stop_visible_stable_polls
+                and (current_text_length > 0 or current_child_count > 0)
+            )
             no_progress_grace = max(silent_freeze_threshold * 2, 30.0)
             is_no_progress_freeze = (
                 not self._generation_was_active

@@ -1432,14 +1432,24 @@ def test_fill_input_contenteditable_triggers_extra_keystroke():
     from core.zendriver_llm_base import ZendriverLLMBase
     from zendriver.core.keys import SpecialKeys
 
+    # The editor really inserts the space, so the nudge's BACKSPACE has to undo it.
+    editor = {"text": "test"}
+
     async def apply_side_effect(js):
         if "document.execCommand('insertText'" in js:
             return None
         if "el.innerText || el.textContent" in js:
-            return "test"
+            return editor["text"]
         return None
 
+    async def send_keys_side_effect(key):
+        if key == SpecialKeys.SPACE:
+            editor["text"] += " "
+        elif key == SpecialKeys.BACKSPACE:
+            editor["text"] = editor["text"][:-1]
+
     fake_el = make_element(tag="div", apply_result=apply_side_effect)
+    fake_el.send_keys = AsyncMock(side_effect=send_keys_side_effect)
     tab = make_tab()
 
     engine = ZendriverLLMBase(
@@ -1458,6 +1468,49 @@ def test_fill_input_contenteditable_triggers_extra_keystroke():
     send_keys_args = [call.args[0] for call in fake_el.send_keys.await_args_list]
     assert SpecialKeys.SPACE in send_keys_args
     assert SpecialKeys.BACKSPACE in send_keys_args
+    assert editor["text"] == "test"
+
+
+def test_fill_input_nudge_does_not_eat_the_last_character_when_the_space_is_dropped():
+    """A dropped SPACE must not be followed by a BACKSPACE.
+
+    Live: on a ~31k-char prompt the editor sometimes dropped the nudge's SPACE,
+    the BACKSPACE then deleted the prompt's own final "}" and fill_input failed
+    verification ("expected 31978 chars, got 31977").
+    """
+    from core.zendriver_llm_base import ZendriverLLMBase
+    from zendriver.core.keys import SpecialKeys
+
+    prompt = 'Reply with {"actions": []}'
+    editor = {"text": prompt}
+
+    async def apply_side_effect(js):
+        if "el.innerText || el.textContent" in js:
+            return editor["text"]
+        return None
+
+    async def send_keys_side_effect(key):
+        # SPACE is dropped; a BACKSPACE would delete the last real character.
+        if key == SpecialKeys.BACKSPACE:
+            editor["text"] = editor["text"][:-1]
+
+    fake_el = make_element(tag="div", apply_result=apply_side_effect)
+    fake_el.send_keys = AsyncMock(side_effect=send_keys_side_effect)
+    tab = make_tab()
+
+    engine = ZendriverLLMBase(
+        service_url="https://www.example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+    )
+    engine._ensure_ready = AsyncMock(return_value=None)
+    engine.driver = tab
+
+    asyncio.run(engine._fill_input(tab, fake_el, prompt))
+
+    send_keys_args = [call.args[0] for call in fake_el.send_keys.await_args_list]
+    assert SpecialKeys.BACKSPACE not in send_keys_args
+    assert editor["text"] == prompt
 
 
 def test_fill_input_verifies_input_value_for_textarea():
@@ -4231,3 +4284,127 @@ def test_tool_choice_none_keeps_a_plain_chat():
     assert response.status_code == 200
     assert "Operating system" not in engine.last_prompt
 
+
+
+# --- _wait_for_response: stable text is only final once generation has stopped ---
+
+
+def _scripted_engine(stages, stop_visible_from):
+    """An engine whose response container follows ``stages`` (one entry per poll).
+
+    ``stages`` is a list of ``(text_length, text)``; ``stop_visible_from(poll)``
+    says whether the stop button is shown on that poll (1-based). Everything the
+    loop reads from the page is replaced so only the stability logic runs.
+    """
+    import tempfile
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    engine = ZendriverLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine._max_page_refresh_attempts = 2
+    engine._page_refresh_attempts = 0
+    state = {"poll": 0}
+
+    def current():
+        return stages[min(state["poll"], len(stages)) - 1]
+
+    async def stats(_container):
+        state["poll"] += 1
+        length, _text = current()
+        return length, 1
+
+    async def extract(_container):
+        return current()[1]
+
+    async def stop_present(_tab):
+        return bool(stop_visible_from(max(state["poll"], 1)))
+
+    engine._click_accept_buttons = AsyncMock(return_value=None)
+    engine._get_latest_response_text = AsyncMock(return_value="")
+    engine._find_response_container_element = AsyncMock(return_value=(object(), "div.response"))
+    engine._get_response_container_stats = stats
+    engine._extract_response_text_from_element = extract
+    engine._stop_button_present = stop_present
+    engine._get_error_indicator_text = AsyncMock(return_value="")
+    engine._is_limit_present = AsyncMock(return_value=False)
+    engine._is_captcha_present = AsyncMock(return_value=False)
+    engine._wait_for_page_ready = AsyncMock(return_value=True)
+    return engine, state
+
+
+def test_stop_visible_stable_polls_stays_under_the_silent_freeze_threshold():
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    assert ZendriverLLMBase._stop_visible_stable_polls(10) == 8
+    assert ZendriverLLMBase._stop_visible_stable_polls(3) == 2
+    assert ZendriverLLMBase._stop_visible_stable_polls("garbage") == 8
+
+
+def test_stable_text_is_final_depends_on_the_stop_button():
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    final = ZendriverLLMBase._stable_text_is_final
+    assert final(False, 1, 8) is False
+    assert final(False, 2, 8) is True
+    assert final(True, 2, 8) is False
+    assert final(True, 7, 8) is False
+    assert final(True, 8, 8) is True
+
+
+def test_wait_for_response_does_not_return_a_mid_stream_pause_while_stop_is_visible(monkeypatch):
+    """Live (17:38 UTC): a ~2s pause with the stop button visible returned "Ah, hai ragione! Sc"."""
+    partial = '{"actions": [{"type": "send_message", "payload": {"text": "Ah, hai ragione! Sc'
+    full = partial + 'usa, ho sbagliato."}}]}'
+    stages = (
+        [(10, "{"), (len(partial), partial)]
+        + [(len(partial), partial)] * 5  # the model pauses: 5 unchanged polls, stop visible
+        + [(len(full), full)]
+        + [(len(full), full)] * 4
+    )
+    # The stop button disappears once the full text has been streamed (poll 9).
+    engine, _state = _scripted_engine(stages, stop_visible_from=lambda poll: poll < 9)
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
+    monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+    tab = make_tab(url="https://example.com")
+    result = asyncio.run(engine._wait_for_response(tab))
+
+    assert result == full
+    tab.reload.assert_not_called()
+
+
+def test_wait_for_response_returns_quickly_once_the_stop_button_is_gone(monkeypatch):
+    stages = [(10, "He"), (20, "Hello there"), (20, "Hello there"), (20, "Hello there"), (20, "Hello there")]
+    engine, state = _scripted_engine(stages, stop_visible_from=lambda poll: False)
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+    result = asyncio.run(engine._wait_for_response(make_tab(url="https://example.com")))
+
+    assert result == "Hello there"
+    # Two unchanged polls after the last change is all it takes (poll 4), as before.
+    assert state["poll"] == 4
+
+
+def test_wait_for_response_accepts_text_when_a_stuck_stop_button_never_goes_away(monkeypatch):
+    """The "UI stuck after completion" case still ends with the reply, after the longer wait."""
+    stages = [(10, "He"), (20, "Hello there")] + [(20, "Hello there")] * 20
+    engine, state = _scripted_engine(stages, stop_visible_from=lambda poll: True)
+
+    monkeypatch.setenv("SELENIUM_RESPONSE_MAX_WAIT", "300")
+    monkeypatch.setenv("SELENIUM_SILENT_FREEZE_THRESHOLD", "10")
+    monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+    tab = make_tab(url="https://example.com")
+    result = asyncio.run(engine._wait_for_response(tab))
+
+    assert result == "Hello there"
+    assert state["poll"] >= 2 + 8  # 8 unchanged polls with the stop button visible
+    tab.reload.assert_not_called()
