@@ -69,7 +69,7 @@ class ScriptedEngine:
     def get_current_model(self) -> str:
         return "default"
 
-    async def generate_response(self, prompt, media=None, timeout=None, agent_mode=False):
+    async def generate_response(self, prompt, media=None, timeout=None):
         self.calls += 1
         outcome = self.outcomes.pop(0) if self.outcomes else "ok"
         if isinstance(outcome, BaseException):
@@ -585,7 +585,7 @@ class _ApiEngine:
     def get_current_model(self) -> str:
         return "default"
 
-    async def generate_response(self, prompt, media=None, timeout=None, agent_mode=False):
+    async def generate_response(self, prompt, media=None, timeout=None):
         return "hello"
 
     async def peek_login_state(self):

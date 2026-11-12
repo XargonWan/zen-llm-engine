@@ -263,42 +263,6 @@ curl -s -X POST http://localhost:8000/engine/my_service/prompt \
 
 ---
 
-## Agentic (tool-calling) mode internals
-
-The agentic lane is implemented entirely in `core/agent_protocol.py` and wired
-into `app.py`. It is **engine-agnostic**: no engine has to opt in or expose
-native function calling — the harness works over plain text scraping.
-
-Flow:
-
-1. `detect_agent_context(data)` inspects the incoming request body. If it
-   carries `tools`, `tool_choice`, `response_format`, or `"mode": "agent"`, it
-   returns an agent context; otherwise `None` (plain chat, unchanged).
-2. `build_agent_system_prompt(agent_ctx)` renders a JSON-only harness that is
-   prepended to the user prompt. It lists the available tools and instructs the
-   model to answer with a single fenced ```json block.
-3. The prompt is enqueued with `agent_mode=True`, which propagates through
-   `EngineManager.enqueue` → `_PromptJob.agent_mode` → the worker loop →
-   `engine.generate_response(..., agent_mode=True)`. In agent mode the base
-   class relaxes the junk filter so short JSON replies are not discarded.
-4. `parse_agent_response(text)` extracts the JSON (fenced block → balanced
-   brace scan → tolerant `json.loads`) and returns a `ParsedAgentResponse`
-   containing either `tool_calls` or final `content`.
-5. If parsing fails (`needs_reformulation`), `app.py` re-enqueues
-   `build_reformulation_prompt()` up to a bounded number of times before giving
-   up and returning the raw text as `content`.
-6. `to_openai_tool_calls(...)` renders the parsed calls into the standard
-   OpenAI `message.tool_calls` shape emitted by `_openai_response`.
-
-Constraints when extending this:
-
-- Keep `core/agent_protocol.py` free of engine names (AGENTS.md rule #7). Use
-  placeholder names like `"my-engine"` in docstrings.
-- The parser must stay tolerant: models wrap JSON in prose, add trailing
-  commas, or use `function`/`actions`/`calls` key variants. Add new shapes to
-  `_normalize_tool_calls` rather than to per-engine code.
-- The lane is stateless — never rely on browser-side conversation history.
-
 ## Contribution checklist
 
 - [ ] File is named `engines/<slug>.json` or `engines/<slug>.py` (no spaces, lowercase).

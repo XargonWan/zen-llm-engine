@@ -23,7 +23,6 @@ from fastapi.responses import (
 )
 
 
-
 from db.db import (
     clear_prompt_logs,
     clear_stats,
@@ -39,18 +38,11 @@ from db.db import (
     inc_requests,
     inc_responses,
 )
-from core.agent_protocol import (
-    build_agent_system_prompt,
-    build_agent_turn_reminder,
-    build_reformulation_prompt,
-    detect_agent_context,
-    needs_reformulation,
-    parse_agent_response,
-    to_openai_tool_calls,
-)
 from core.engine_manager import EngineManager
 from core.errors import EngineUnavailableError
 from core import debug_mode, proc_utils
+from core import terminal_tools
+from core.terminal_mode import build_terminal_prompt, is_terminal_mode
 from core.zendriver_llm_base import get_browser_stats
 from core.models import (
     ChatCompletion,
@@ -120,7 +112,9 @@ def _guess_filename(media_type: str, mime_type: str, index: int) -> str:
     return f"{media_type}_{index}{extension}"
 
 
-def _map_media_capabilities_to_model_caps(media_capabilities: list[str]) -> dict[str, bool]:
+def _map_media_capabilities_to_model_caps(
+    media_capabilities: list[str],
+) -> dict[str, bool]:
     capabilities: dict[str, bool] = {}
     if "image" in media_capabilities:
         capabilities["vision"] = True
@@ -132,7 +126,9 @@ def _map_media_capabilities_to_model_caps(media_capabilities: list[str]) -> dict
 def _parse_media_part(part: dict, index: int) -> MediaItem:
     raw_media_type = str(part.get("type", "")).strip()
     if not raw_media_type:
-        mime_type_hint = str(part.get("mime_type") or part.get("content_type") or "").strip().lower()
+        mime_type_hint = (
+            str(part.get("mime_type") or part.get("content_type") or "").strip().lower()
+        )
         if mime_type_hint.startswith("image/"):
             raw_media_type = "image"
         elif mime_type_hint.startswith("audio/"):
@@ -147,7 +143,9 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
     elif raw_media_type in ("input_file", "file", "document", "input_document"):
         media_type = "document"
     else:
-        raise HTTPException(status_code=400, detail=f"Unsupported media type: {raw_media_type}")
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported media type: {raw_media_type}"
+        )
 
     if media_type == "image":
         # Support both flat {"url": "..."} and OpenAI vision {"image_url": {"url": "..."}}
@@ -155,7 +153,11 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
         source = (
             part.get("url")
             or part.get("data")
-            or (image_url_nested.get("url") if isinstance(image_url_nested, dict) else None)
+            or (
+                image_url_nested.get("url")
+                if isinstance(image_url_nested, dict)
+                else None
+            )
         )
         if not source:
             raise HTTPException(status_code=400, detail="Missing image URL or data")
@@ -173,7 +175,9 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
         try:
             data = base64.b64decode(source)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail="Invalid base64 media data") from exc
+            raise HTTPException(
+                status_code=400, detail="Invalid base64 media data"
+            ) from exc
         if media_type == "audio":
             mime_type = part.get("mime_type") or "audio/mpeg"
         else:
@@ -181,8 +185,12 @@ def _parse_media_part(part: dict, index: int) -> MediaItem:
     else:
         raise HTTPException(status_code=400, detail="Unsupported media payload format")
 
-    filename = str(part.get("filename") or _guess_filename(media_type, mime_type, index))
-    return MediaItem(media_type=media_type, data=data, mime_type=mime_type, filename=filename)
+    filename = str(
+        part.get("filename") or _guess_filename(media_type, mime_type, index)
+    )
+    return MediaItem(
+        media_type=media_type, data=data, mime_type=mime_type, filename=filename
+    )
 
 
 def _try_parse_json_string(value: Any) -> Any:
@@ -214,8 +222,18 @@ def _is_media_part(part: Any) -> bool:
         "input_document",
     ):
         return True
-    mime_type = str(part.get("mime_type") or part.get("content_type") or "").strip().lower()
-    return bool(mime_type and (mime_type.startswith("image/") or mime_type.startswith("audio/") or mime_type.startswith("video/") or mime_type.startswith("application/")))
+    mime_type = (
+        str(part.get("mime_type") or part.get("content_type") or "").strip().lower()
+    )
+    return bool(
+        mime_type
+        and (
+            mime_type.startswith("image/")
+            or mime_type.startswith("audio/")
+            or mime_type.startswith("video/")
+            or mime_type.startswith("application/")
+        )
+    )
 
 
 def _extract_text_and_media(content: Any, media_items: list[MediaItem]) -> str:
@@ -235,8 +253,12 @@ def _extract_text_and_media(content: Any, media_items: list[MediaItem]) -> str:
             for attachment in attachments:
                 if _is_media_part(attachment):
                     try:
-                        media_items.append(_parse_media_part(attachment, len(media_items)))
-                        logger.debug("[selenium] Extracted media attachment from attachments array")
+                        media_items.append(
+                            _parse_media_part(attachment, len(media_items))
+                        )
+                        logger.debug(
+                            "[selenium] Extracted media attachment from attachments array"
+                        )
                     except HTTPException:
                         pass
                 else:
@@ -261,7 +283,9 @@ def _extract_text_and_media(content: Any, media_items: list[MediaItem]) -> str:
     return str(content)
 
 
-def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
+def _normalize_prompt_payload(
+    payload: Any, label_system: bool = True
+) -> tuple[str, list[MediaItem]]:
     prompt_text = ""
     media_items: list[MediaItem] = []
 
@@ -289,7 +313,10 @@ def _normalize_prompt_payload(payload: Any) -> tuple[str, list[MediaItem]]:
 
         parts: list[str] = []
         if system_parts:
-            parts.append("[INSTRUCTIONS]:\n" + "\n\n".join(system_parts))
+            joined_system = "\n\n".join(system_parts)
+            parts.append(
+                "[INSTRUCTIONS]:\n" + joined_system if label_system else joined_system
+            )
         if user_parts:
             parts.extend(user_parts)
         prompt_text = "\n\n".join(parts)
@@ -370,10 +397,10 @@ def _signal_handler(sig: int) -> None:
 async def _lifespan(app: FastAPI):  # type: ignore[type-arg]
     # ---- startup ----
     init_database()
-    manager = EngineManager.get()           # initialize manager
-    manager.start_orphan_cleanup()          # start periodic orphan cleanup
-    manager.start_login_watch()             # passive re-login detection (breaker recovery)
-    _register_engine_routes(app)            # dynamic per-engine /name/prompt routes
+    manager = EngineManager.get()  # initialize manager
+    manager.start_orphan_cleanup()  # start periodic orphan cleanup
+    manager.start_login_watch()  # passive re-login detection (breaker recovery)
+    _register_engine_routes(app)  # dynamic per-engine /name/prompt routes
 
     # Register signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
@@ -420,6 +447,7 @@ async def _engine_unavailable_handler(
             },
         },
     )
+
 
 # Rate limiting (per ip, sliding window)
 RATE_LIMIT_WINDOW = 60  # seconds
@@ -488,26 +516,15 @@ def _openai_response(
     prompt: str,
     response_text: str,
     elapsed_ms: int,
-    agent_parsed: Any = None,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     prompt_tokens = _estimate_tokens(prompt)
     completion_tokens = _estimate_tokens(response_text)
-
-    # Agent mode: emit OpenAI tool_calls when the model requested tool use.
-    if agent_parsed is not None and getattr(agent_parsed, "tool_calls", None):
-        message: Dict[str, Any] = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": to_openai_tool_calls(agent_parsed.tool_calls),
-        }
+    message: Dict[str, Any] = {"role": "assistant", "content": response_text}
+    finish_reason = "stop"
+    if tool_calls:
+        message = {"role": "assistant", "content": None, "tool_calls": tool_calls}
         finish_reason = "tool_calls"
-    else:
-        # Prefer parsed final content when available, else the raw scraped text.
-        content = response_text
-        if agent_parsed is not None and getattr(agent_parsed, "content", None):
-            content = agent_parsed.content
-        message = {"role": "assistant", "content": content}
-        finish_reason = "stop"
 
     return {
         "id": f"llm_{int(time.time())}",
@@ -532,21 +549,46 @@ def _openai_response(
     }
 
 
+_DEFAULT_TOOLS_PROMPT_BUDGET = 20000
+_MIN_TOOLS_PROMPT_BUDGET = 4000
+
+
+def _tools_prompt_budget(engine_name: str) -> int:
+    """Characters a tools session may use: ``ZEN_TOOLS_PROMPT_BUDGET``, else the
+    engine's own prompt limit (never below a floor), else a safe default."""
+    raw = os.getenv("ZEN_TOOLS_PROMPT_BUDGET")
+    if raw and raw.strip().lstrip("-").isdigit():
+        return int(raw)
+    try:
+        engine = EngineManager.get().engines.get(engine_name)
+        limit = int(engine.get_interface_limits().get("max_prompt_chars") or 0)
+    except Exception:  # noqa: BLE001 - the engine may not be started yet
+        limit = 0
+    return (
+        max(limit, _MIN_TOOLS_PROMPT_BUDGET)
+        if limit > 0
+        else _DEFAULT_TOOLS_PROMPT_BUDGET
+    )
+
+
+def _answer_text(outcome: "terminal_tools.Outcome") -> str:
+    """The text answer of an outcome: the session's answer, else the raw reply."""
+    return outcome.content if outcome.content is not None else outcome.text
+
+
 def _openai_chunk(
     chunk_id: str,
     model_name: str,
     content: str,
     finish_reason: Any,
-    tool_calls: Any = None,
+    tool_calls: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Format a single SSE chunk in OpenAI chat.completion.chunk format.
-
-    When *tool_calls* is provided (agent mode), it is emitted in the delta
-    instead of textual content so streaming clients receive structured tool
-    calls exactly like the non-streaming path.
-    """
+    """Format a single SSE chunk in OpenAI chat.completion.chunk format."""
     if tool_calls:
-        delta: Dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls}
+        delta: Dict[str, Any] = {
+            "role": "assistant",
+            "tool_calls": [{"index": i, **call} for i, call in enumerate(tool_calls)],
+        }
     elif content:
         delta = {"role": "assistant", "content": content}
     else:
@@ -565,9 +607,6 @@ def _openai_chunk(
         ],
     }
     return f"data: {json.dumps(payload)}\n\n"
-
-
-
 
 
 @app.get("/")
@@ -600,7 +639,9 @@ async def api_status() -> JSONResponse:
     """
     engines = EngineManager.get().health_snapshot()
     states = {e["state"] for e in engines}
-    overall = "down" if "down" in states else ("degraded" if "degraded" in states else "ok")
+    overall = (
+        "down" if "down" in states else ("degraded" if "degraded" in states else "ok")
+    )
     rss = proc_utils.rss_mb()
     warn_mb = int(os.getenv("ZEN_RSS_WARN_MB", "2048") or 0)
     body = {
@@ -622,7 +663,9 @@ async def api_health() -> JSONResponse:
     """Same body as ``/api/status`` but 503 when any engine is ``down``."""
     response = await api_status()
     payload = json.loads(response.body)
-    return JSONResponse(status_code=503 if payload["status"] == "down" else 200, content=payload)
+    return JSONResponse(
+        status_code=503 if payload["status"] == "down" else 200, content=payload
+    )
 
 
 @app.post("/api/engines/{engine_name}/pause")
@@ -654,7 +697,11 @@ async def api_engine_recover(engine_name: str) -> Dict[str, Any]:
         canonical = mgr._resolve(engine_name)
     except ValueError:
         raise HTTPException(status_code=404, detail=f"Engine not found: {engine_name}")
-    return {"status": "ok", "engine": canonical, "was_open": mgr.reset_breaker(canonical)}
+    return {
+        "status": "ok",
+        "engine": canonical,
+        "was_open": mgr.reset_breaker(canonical),
+    }
 
 
 @app.get("/api/debug/page-html", response_class=HTMLResponse)
@@ -740,7 +787,7 @@ async def models() -> LegacyModelList:
             "id": engine_name,
             "object": "model",
             "created": created,
-"owned_by": "zen-llm-engine",
+            "owned_by": "zen-llm-engine",
             # Legacy extra fields (kept for backward compat)
             "name": engine_name,
             "capabilities": _map_media_capabilities_to_model_caps(
@@ -807,7 +854,9 @@ async def login_state(engine_name: str) -> Dict[str, Any]:
         peeked = await engine.peek_login_state()
         state = {
             "logged_in": peeked is True,
-            "login_state": "logged" if peeked is True else ("unlogged" if peeked is False else "unknown"),
+            "login_state": "logged"
+            if peeked is True
+            else ("unlogged" if peeked is False else "unknown"),
             "breaker": "open",
         }
     else:
@@ -835,6 +884,7 @@ async def engine_prompt(engine_name: str, req: Request) -> Any:
         model_name=data.get("model", canonical),
         stream=bool(data.get("stream", False)),
         timeout=data.get("timeout"),
+        mode=data.get("mode"),
     )
 
 
@@ -954,7 +1004,14 @@ async def openai_chat(req: Request) -> Any:
     else:
         raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
-    unsupported_openai_params = ["logprobs", "top_logprobs", "logit_bias", "n", "presence_penalty", "frequency_penalty"]
+    unsupported_openai_params = [
+        "logprobs",
+        "top_logprobs",
+        "logit_bias",
+        "n",
+        "presence_penalty",
+        "frequency_penalty",
+    ]
     unsupported_present = [key for key in unsupported_openai_params if key in data]
     if unsupported_present:
         logger.warning(
@@ -964,18 +1021,16 @@ async def openai_chat(req: Request) -> Any:
 
     stream = bool(data.get("stream", False))
 
-    # Detect the agentic (tool-calling) lane from OpenAI agentic fields.
-    agent_ctx = detect_agent_context(data)
-    if agent_ctx is not None:
-        logger.info(
-            "[agent] Agentic request detected (tools=%d, response_format=%s)",
-            len(agent_ctx.get("tools") or []),
-            bool(agent_ctx.get("response_format")),
-        )
-
     return await _prompt(
-        engine, req, explicit_prompt=prompt_payload, model_name=model, stream=stream,
-        timeout=data.get("timeout"), agent_ctx=agent_ctx,
+        engine,
+        req,
+        explicit_prompt=prompt_payload,
+        model_name=model,
+        stream=stream,
+        timeout=data.get("timeout"),
+        mode=data.get("mode"),
+        tools=data.get("tools"),
+        tool_choice=data.get("tool_choice"),
     )
 
 
@@ -992,7 +1047,9 @@ async def _prompt(
     model_name: str = "default",
     stream: bool = False,
     timeout: int | None = None,
-    agent_ctx: Dict[str, Any] | None = None,
+    mode: Any = None,
+    tools: Any = None,
+    tool_choice: Any = None,
 ) -> Any:
     if RESET_IN_PROGRESS:
         raise HTTPException(
@@ -1010,35 +1067,66 @@ async def _prompt(
     if explicit_prompt is None:
         payload = await _safe_parse_json(req)
         prompt_payload = payload.get("prompt") or payload.get("messages")
+        mode = payload.get("mode", mode)
+        tools = payload.get("tools", tools)
+        tool_choice = payload.get("tool_choice", tool_choice)
     else:
         prompt_payload = explicit_prompt
 
     if prompt_payload is None:
         raise HTTPException(status_code=400, detail="Missing prompt/messages")
 
-    prompt_text, media_items = _normalize_prompt_payload(prompt_payload)
-    if not prompt_text and not media_items:
-        raise HTTPException(status_code=400, detail="Missing prompt/messages")
-
-    if not isinstance(prompt_text, str):
-        prompt_text = str(prompt_text)
-
-    # Agent mode: prepend the tool-calling harness so the browser-driven model
-    # replies with parseable JSON. The scraped reply is parsed below with a
-    # bounded reformulation retry.
-    agent_mode = agent_ctx is not None
-    has_tools = False
-    if agent_mode:
-        # Prepend the full harness AND append a short in-character reminder so
-        # the roleplay contract is both the first and the LAST thing the model
-        # reads — on long multi-turn histories the leading harness alone drifts
-        # out of context and the model reverts to a plain "safe assistant".
-        has_tools = bool(agent_ctx.get("tools"))
-        prompt_text = (
-            build_agent_system_prompt(agent_ctx)
-            + prompt_text
-            + build_agent_turn_reminder(has_tools, agent_ctx.get("tools"))
+    # A client that sends OpenAI `tools` gets the terminal-session adapter
+    # (core/terminal_tools.py): the tools become commands and the reply comes
+    # back as standard `tool_calls`.
+    specs = [] if tool_choice == "none" else terminal_tools.parse_tools(tools)
+    session: terminal_tools.Session | None = None
+    terminal = is_terminal_mode(mode)
+    if specs:
+        media_items: list[MediaItem] = []
+        messages = (
+            prompt_payload
+            if isinstance(prompt_payload, list)
+            else [{"role": "user", "content": prompt_payload}]
         )
+        task, blocks = terminal_tools.split_conversation(
+            messages, lambda c: _extract_text_and_media(c, media_items)
+        )
+        if not task.strip() and not blocks and not media_items:
+            raise HTTPException(status_code=400, detail="Missing prompt/messages")
+        session = terminal_tools.fit_session(
+            terminal_tools.Session(
+                specs,
+                terminal_tools.normalize_style(os.getenv("ZEN_TOOL_STYLE")),
+                task,
+                blocks,
+            ),
+            _tools_prompt_budget(engine_name),
+        )
+        prompt_text = build_terminal_prompt(
+            terminal_tools.compose(
+                session.task,
+                terminal_tools.render_catalog(specs, session.style),
+                session.transcript,
+            )
+        )
+    else:
+        prompt_text, media_items = _normalize_prompt_payload(
+            prompt_payload, label_system=not terminal
+        )
+        if not prompt_text and not media_items:
+            raise HTTPException(status_code=400, detail="Missing prompt/messages")
+
+        if not isinstance(prompt_text, str):
+            prompt_text = str(prompt_text)
+
+    # Terminal mode: present the exchange as a plain shell session (see
+    # core/terminal_mode.py). The reply is returned untouched; interpreting it
+    # is the caller's job. This replaced a JSON tool-call harness: it was removed
+    # in commit 35901f0 and is kept on branch backup/json-agent-lane (find it with
+    # `git log --diff-filter=D -- core/agent_protocol.py`).
+    if terminal and session is None:
+        prompt_text = build_terminal_prompt(prompt_text)
 
     current_task = asyncio.current_task()
     if current_task is not None:
@@ -1051,12 +1139,27 @@ async def _prompt(
         engine_name,
         model=model_name,
         stream=stream,
-        agent_mode=agent_mode,
         media_count=len(media_items),
         prompt=prompt_text,
     )
     try:
         mgr = EngineManager.get()
+
+        async def complete() -> terminal_tools.Outcome:
+            """One engine round: plain, or a tools session of one or more sends."""
+            if session is None:
+                res = await mgr.enqueue(
+                    engine_name, prompt_text, media_items, timeout=timeout
+                )
+                return terminal_tools.Outcome(
+                    None, None, res.text, prompt_text, res.model_name
+                )
+            return await terminal_tools.run_session(
+                lambda text: mgr.enqueue(
+                    engine_name, text, media_items, timeout=timeout
+                ),
+                session,
+            )
 
         if stream:
 
@@ -1064,10 +1167,7 @@ async def _prompt(
                 try:
                     # Start engine work as a concurrent task so we can yield
                     # SSE heartbeats while waiting, keeping the connection alive.
-                    result_future = asyncio.ensure_future(
-                        mgr.enqueue(engine_name, prompt_text, media_items,
-                                    timeout=timeout, agent_mode=agent_mode)
-                    )
+                    result_future = asyncio.ensure_future(complete())
 
                     heartbeat_interval = 5.0  # seconds
                     while not result_future.done():
@@ -1081,37 +1181,6 @@ async def _prompt(
                             yield ": heartbeat\n\n"
 
                     result_obj = result_future.result()
-
-                    # Agent mode over SSE: apply the SAME parse + bounded
-                    # reformulation as the non-streaming path, otherwise the
-                    # scraped JSON (e.g. a bare {"content": "..."} promise or a
-                    # tool call) would be streamed back as raw text and the
-                    # client would never receive structured tool_calls.
-                    agent_parsed = None
-                    if agent_mode:
-                        agent_parsed = parse_agent_response(result_obj.text)
-                        max_reformulations = 2
-                        attempts = 0
-                        while (
-                            needs_reformulation(agent_parsed, has_tools=has_tools)
-                            and attempts < max_reformulations
-                        ):
-                            attempts += 1
-                            logger.warning(
-                                "[agent] Stream reply needs reformulation, "
-                                "attempt %d/%d",
-                                attempts,
-                                max_reformulations,
-                            )
-                            retry_obj = await mgr.enqueue(
-                                engine_name,
-                                build_reformulation_prompt(prompt_text),
-                                media_items,
-                                timeout=timeout,
-                                agent_mode=True,
-                            )
-                            result_obj = retry_obj
-                            agent_parsed = parse_agent_response(result_obj.text)
 
                     elapsed_ms = int((time.time() - start) * 1000)
                     if media_items:
@@ -1134,32 +1203,25 @@ async def _prompt(
                     )
                     inc_responses()
                     chunk_id = f"llm_{int(time.time())}"
-                    if agent_parsed is not None and agent_parsed.tool_calls:
-                        # Emit structured tool calls, then close with the
-                        # OpenAI-mandated "tool_calls" finish reason.
+                    if result_obj.tool_calls:
                         yield _openai_chunk(
                             chunk_id,
                             result_obj.model_name,
                             "",
                             None,
-                            tool_calls=to_openai_tool_calls(agent_parsed.tool_calls),
+                            tool_calls=result_obj.tool_calls,
                         )
                         yield _openai_chunk(
                             chunk_id, result_obj.model_name, "", "tool_calls"
                         )
                     else:
-                        # Final textual answer: prefer the parsed content over
-                        # the raw scraped text so the client never sees the
-                        # JSON wrapper.
-                        out_text = result_obj.text
-                        if agent_parsed is not None and agent_parsed.content:
-                            out_text = agent_parsed.content
                         yield _openai_chunk(
-                            chunk_id, result_obj.model_name, out_text, None
+                            chunk_id,
+                            result_obj.model_name,
+                            _answer_text(result_obj),
+                            None,
                         )
-                        yield _openai_chunk(
-                            chunk_id, result_obj.model_name, "", "stop"
-                        )
+                        yield _openai_chunk(chunk_id, result_obj.model_name, "", "stop")
                     yield "data: [DONE]\n\n"
                 except Exception as e:
                     if isinstance(e, EngineUnavailableError):
@@ -1181,36 +1243,7 @@ async def _prompt(
 
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
-        result_obj = await mgr.enqueue(engine_name, prompt_text, media_items,
-                                        timeout=timeout, agent_mode=agent_mode)
-
-        agent_parsed = None
-        if agent_mode:
-            agent_parsed = parse_agent_response(result_obj.text)
-            # Bounded reformulation retries when the reply is not parseable —
-            # or when the model returned a valid {"content": ...} that is really
-            # an out-of-character refusal to use the available tools.
-            max_reformulations = 2
-            attempts = 0
-            while (
-                needs_reformulation(agent_parsed, has_tools=has_tools)
-                and attempts < max_reformulations
-            ):
-                attempts += 1
-                logger.warning(
-                    "[agent] Unparseable reply, reformulation attempt %d/%d",
-                    attempts,
-                    max_reformulations,
-                )
-                # Stateless engines refresh the page between turns, so re-send
-                # the full harness + original request (not a bare nudge) to keep
-                # the tool list and task in context on every retry.
-                retry_obj = await mgr.enqueue(
-                    engine_name, build_reformulation_prompt(prompt_text), media_items,
-                    timeout=timeout, agent_mode=True,
-                )
-                result_obj = retry_obj
-                agent_parsed = parse_agent_response(result_obj.text)
+        result_obj = await complete()
 
         duration_ms = int((time.time() - start) * 1000)
         if media_items:
@@ -1237,9 +1270,9 @@ async def _prompt(
             engine_name,
             result_obj.model_name,
             prompt_text,
-            result_obj.text,
+            _answer_text(result_obj),
             duration_ms,
-            agent_parsed=agent_parsed,
+            tool_calls=result_obj.tool_calls,
         )
 
     except asyncio.CancelledError:
@@ -1368,7 +1401,10 @@ async def set_debug_state(body: Dict[str, Any]) -> Dict[str, Any]:
 @app.get("/api/debug/log")
 async def debug_log(since: int = 0) -> Dict[str, Any]:
     """Return buffered debug-trace events with seq > since (incremental polling)."""
-    return {"events": debug_mode.get_events(since), "enabled": debug_mode.debug_enabled()}
+    return {
+        "events": debug_mode.get_events(since),
+        "enabled": debug_mode.debug_enabled(),
+    }
 
 
 @app.post("/api/debug/clear")

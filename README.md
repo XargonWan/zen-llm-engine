@@ -261,80 +261,61 @@ If the chosen engine supports audio uploads, use `type: "input_audio"` with a ba
 }
 ```
 
-## Agentic (tool-calling) mode
+## Terminal mode
 
-`/v1/chat/completions` automatically switches to an **agentic lane** when the
-request carries any OpenAI agentic field:
+Some chat UIs refuse a prompt that announces an agent or tool harness, but
+answer happily when the exchange looks like a plain shell session. Send
+`"mode": "terminal"` to `/v1/chat/completions` (or `/engine/<name>/prompt`) and
+the server frames the prompt that way:
 
-- `tools` (non-empty list of function definitions)
-- `tool_choice`
-- `response_format` (e.g. `{"type": "json_object"}`)
+```text
+<your messages, system text first, without the [INSTRUCTIONS] label>
 
-You can also force it explicitly with `"mode": "agent"`.
+Operating system: Linux
+Language: bash
 
-In this mode the server injects a JSON-only harness into the prompt so the
-browser-driven model answers with a single structured JSON object, then parses
-that reply back into standard OpenAI `tool_calls`.
+Give me only the commands, a single command string at a time, that I can copy
+and paste into a terminal, nothing else. I can answer you with prose or output.
+When you think we are done, write me only:
 
-Example request with tools:
-
-```bash
-curl -X POST "http://localhost:14848/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "chatgpt",
-    "messages": [{"role": "user", "content": "What is the weather in Rome?"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get the weather for a city",
-        "parameters": {
-          "type": "object",
-          "properties": {"city": {"type": "string"}},
-          "required": ["city"]
-        }
-      }
-    }]
-  }'
+----END----
 ```
 
-When the model decides to call a tool the response uses the standard OpenAI
-shape (`content` is `null`, `finish_reason` is `tool_calls`):
+The frame is static and always English; your own text is passed through in
+whatever language it is written. The reply comes back as ordinary chat text,
+untouched: this service does not parse commands, call tools or build
+`tool_calls`. The caller runs each command, then re-sends the whole transcript
+(the engines are stateless) with the command output appended, and treats a
+reply of exactly `----END----` as the end of the session.
 
-```json
-{
-  "choices": [{
-    "index": 0,
-    "message": {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [{
-        "id": "call_0",
-        "type": "function",
-        "function": {"name": "get_weather", "arguments": "{\"city\": \"Rome\"}"}
-      }]
-    },
-    "finish_reason": "tool_calls"
-  }]
-}
-```
+### OpenAI tool calling (any agent client)
 
-When the model gives a final answer instead, `finish_reason` is `stop` and the
-text is returned in `message.content` as usual.
+A request that carries the standard OpenAI `tools` list (and a `tool_choice`
+other than `"none"`) is served through the same terminal framing, so agent
+clients such as Hermes, Cline or Open WebUI work with every engine unchanged:
 
-**Notes and limits:**
+- the tools are presented as commands installed on the machine
+  (`get_weather --city <string> [--days <integer>]  # Get the weather ...`);
+- earlier `assistant.tool_calls` and `tool` messages are replayed as
+  `$ command` / output (the engines are stateless);
+- the model's reply is read as one command line and returned as a standard
+  `message.tool_calls` entry with `finish_reason: "tool_calls"` (streaming
+  works too);
+- `----END----` ends the session: the answer is whatever the model wrote before
+  the marker, or, if it wrote nothing, a follow-up plain-text request asks for
+  it. If the client offers an `attempt_completion` tool, the end becomes a call
+  to it with that answer as `summary`;
+- a reply that is not a command is asked again (up to twice); a command that
+  matches no tool is answered `bash: <cmd>: command not found` first.
 
-- The agentic lane is **stateless**: the caller must re-send the full
-  conversation (including previous `tool_calls` and `tool` results) on every
-  request, exactly as with the OpenAI API.
-- Output is **best-effort**. If the model's first reply cannot be parsed, the
-  server issues a bounded number of *reformulation* retries nudging it back to
-  valid JSON. If it still fails, the raw text is returned as `content`.
-- Real token streaming is not supported for tool calls; the response is
-  delivered once parsing completes.
-- The feature is fully **engine-agnostic** — it works with any configured
-  engine and requires no engine-specific configuration.
+`ZEN_TOOL_STYLE=bash` stops listing the tools and lets the model improvise
+plain commands, for chat UIs that object to the catalog. Replies are best
+effort: the model may stray, and tools with large or nested schemas are
+flattened to `--key value` flags.
+
+Previous versions had a JSON tool-calling harness (`tools` / `response_format`
+/ `"mode": "agent"`). It was removed in commit `35901f0` and is kept on the
+`backup/json-agent-lane` branch.
 
 3. Prompt example (API call)
 
