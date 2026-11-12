@@ -11,6 +11,9 @@ AGENT_TAIL_MARKER = "<<<AGENT_TAIL>>>"
 # Request field that switches a chat completion into terminal mode.
 TERMINAL_MODE = "terminal"
 
+# What the model writes, alone on a line, when it considers the session done.
+END_MARKER = "----END----"
+
 # Static frame, always English. It is what makes the model treat the exchange
 # as a plain shell session (the caller pastes each command's output back) rather
 # than as a tool-calling harness, which some chat UIs refuse outright.
@@ -23,7 +26,7 @@ _TERMINAL_FRAME = (
     "or output.\n"
     "When you think we are done, write me only:\n"
     "\n"
-    "----END----"
+    f"{END_MARKER}"
 )
 
 

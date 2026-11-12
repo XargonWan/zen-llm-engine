@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 import asyncio
 import json
+import re
 import threading
 import time
 from typing import Any
@@ -4146,3 +4147,87 @@ def test_terminal_mode_on_the_engine_prompt_route():
     assert response.status_code == 200
     assert engine.last_prompt.startswith("list the disks")
     assert "Language: bash" in engine.last_prompt
+
+
+# ---------------------------------------------------------------------------
+# OpenAI tools -> terminal session adapter
+# ---------------------------------------------------------------------------
+
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+def _tools_request(**extra):
+    return {
+        "model": "chatgpt",
+        "messages": [{"role": "user", "content": "Weather in Rome?"}],
+        "tools": [_WEATHER_TOOL],
+        **extra,
+    }
+
+
+def test_tools_request_returns_standard_tool_calls():
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = "get_weather --city Rome"
+    response = client.post("/v1/chat/completions", json=_tools_request())
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    call = choice["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Rome"}
+    assert "get_weather --city <string>" in engine.last_prompt
+    assert engine.last_prompt.rstrip().endswith("----END----")
+    assert not re.search(r"agent|roleplay|json", engine.last_prompt.replace("<<<AGENT_TAIL>>>", ""), re.I)
+
+
+def test_tools_request_replays_the_tool_result_and_ends_with_the_answer():
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = ["----END----", "It is sunny in Rome."]
+    body = _tools_request()
+    body["messages"] += [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": '{"city": "Rome"}'}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "sunny, 24C"},
+    ]
+    response = client.post("/v1/chat/completions", json=body)
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "It is sunny in Rome."
+
+
+def test_tools_request_streams_tool_calls():
+    engine = EngineManager.get().engines["chatgpt"]
+    engine.next_response = "get_weather Rome"
+    with client.stream("POST", "/v1/chat/completions", json=_tools_request(stream=True)) as resp:
+        lines = [ln for ln in resp.iter_lines() if ln.startswith("data: ") and "[DONE]" not in ln]
+    chunks = [json.loads(ln[6:]) for ln in lines]
+    deltas = [c["choices"][0]["delta"] for c in chunks]
+    assert deltas[0]["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_choice_none_keeps_a_plain_chat():
+    engine = EngineManager.get().engines["chatgpt"]
+    response = client.post("/v1/chat/completions", json=_tools_request(tool_choice="none"))
+    assert response.status_code == 200
+    assert "Operating system" not in engine.last_prompt
+
