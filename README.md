@@ -288,6 +288,31 @@ untouched: this service does not parse commands, call tools or build
 (the engines are stateless) with the command output appended, and treats a
 reply of exactly `----END----` as the end of the session.
 
+### OpenAI tool calling (any agent client)
+
+A request that carries the standard OpenAI `tools` list (and a `tool_choice`
+other than `"none"`) is served through the same terminal framing, so agent
+clients such as Hermes, Cline or Open WebUI work with every engine unchanged:
+
+- the tools are presented as commands installed on the machine
+  (`get_weather --city <string> [--days <integer>]  # Get the weather ...`);
+- earlier `assistant.tool_calls` and `tool` messages are replayed as
+  `$ command` / output (the engines are stateless);
+- the model's reply is read as one command line and returned as a standard
+  `message.tool_calls` entry with `finish_reason: "tool_calls"` (streaming
+  works too);
+- `----END----` ends the session: the answer is whatever the model wrote before
+  the marker, or, if it wrote nothing, a follow-up plain-text request asks for
+  it. If the client offers an `attempt_completion` tool, the end becomes a call
+  to it with that answer as `summary`;
+- a reply that is not a command is asked again (up to twice); a command that
+  matches no tool is answered `bash: <cmd>: command not found` first.
+
+`ZEN_TOOL_STYLE=bash` stops listing the tools and lets the model improvise
+plain commands, for chat UIs that object to the catalog. Replies are best
+effort: the model may stray, and tools with large or nested schemas are
+flattened to `--key value` flags.
+
 Previous versions had a JSON tool-calling harness (`tools` / `response_format`
 / `"mode": "agent"`). It was removed in commit `35901f0` and is kept on the
 `backup/json-agent-lane` branch.
