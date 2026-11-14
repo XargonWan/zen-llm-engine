@@ -2,7 +2,7 @@
   "name": "chatgpt",
   "display_name": "ChatGPT (OpenAI)",
   "aliases": ["chatgpt", "openai", "gpt"],
-  "service_url": "https://chat.openai.com",
+  "service_url": "https://chatgpt.com",
   "notes": "Media support disabled for this engine because file uploads depend on files.oaiusercontent.com, which is blocked or unavailable in the current environment.",
   "default_model": "gpt-4o",
   "allow_unlogged": true,
@@ -67,7 +67,7 @@
     }
   },
   "login_detection": {
-    "url_prefix": "https://chat.openai.com",
+    "url_prefix": "https://chatgpt.com",
     "url_deny_keywords": ["login", "auth", "signin"],
     "login_button_xpath": "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]",
     "authenticated_css_selectors": [

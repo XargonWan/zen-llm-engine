@@ -1091,6 +1091,24 @@ def test_chatgpt_response_area_uses_the_semantic_attributes_first():
     assert "div.markdown.prose" in selectors
 
 
+def test_chatgpt_conversation_urls_are_on_the_same_site():
+    """ChatGPT lives on chatgpt.com. With the old ``chat.openai.com`` as
+    ``service_url`` a new conversation (``https://chatgpt.com/c/<id>``) counted
+    as an off-site redirect, so a reply that finished before the stop button was
+    seen made the send look like a login redirect and was failed. A real login
+    host must still be off-site."""
+    from pathlib import Path
+
+    from core.json_engine import JsonEngine
+
+    engines_dir = Path(__file__).parent.parent / "engines"
+    engine = JsonEngine(engines_dir / "chatgpt.json")
+
+    assert engine._is_same_site("https://chatgpt.com/c/6af8e41e-fc44")
+    assert engine._is_same_site("https://chatgpt.com/")
+    assert not engine._is_same_site("https://auth.openai.com/log-in")
+
+
 def test_gemini_authenticated_selectors_exclude_chat_ui():
     """Chat input/response classes must not be treated as a login signal.
 
