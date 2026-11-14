@@ -5,6 +5,7 @@
   "service_url": "https://chatgpt.com",
   "notes": "Media support disabled for this engine because file uploads depend on files.oaiusercontent.com, which is blocked or unavailable in the current environment.",
   "default_model": "gpt-4o",
+  "fresh_chat_per_request": true,
   "allow_unlogged": true,
   "models": {
     "gpt-4o": 60000,

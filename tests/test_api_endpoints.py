@@ -1109,6 +1109,21 @@ def test_chatgpt_conversation_urls_are_on_the_same_site():
     assert not engine._is_same_site("https://auth.openai.com/log-in")
 
 
+def test_chatgpt_opens_a_fresh_chat_for_every_request():
+    """The API is stateless: every request carries the whole context, which the
+    server flattens into one prompt. Pasting that into one ever-growing ChatGPT
+    conversation fills the context window after a few turns ("Context window
+    full") and every later request fails. Each request gets its own chat, as the
+    other stateless engine (gemini) already does."""
+    from pathlib import Path
+
+    from core.json_engine import JsonEngine
+
+    engine = JsonEngine(Path(__file__).parent.parent / "engines" / "chatgpt.json")
+
+    assert engine._fresh_chat_per_request is True
+
+
 def test_gemini_authenticated_selectors_exclude_chat_ui():
     """Chat input/response classes must not be treated as a login signal.
 
