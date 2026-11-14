@@ -1064,6 +1064,33 @@ def test_json_engine_loads_error_indicator_selectors():
     assert "simple-snack-bar" in " ".join(engine.error_indicator_selectors)
 
 
+def test_chatgpt_response_area_uses_the_semantic_attributes_first():
+    """ChatGPT's redesigned chat has no ``data-message-author-role`` and no
+    ``div.markdown``: the answer sits in a ``data-response-body`` block (also
+    ``data-markdown-text-style="assistant-message"`` and ``data-dil-response``;
+    the user's message has none of them). With only the old selectors the
+    watcher read ``text_len=0`` for 30 s, took a working page for frozen,
+    refreshed it and opened the circuit breaker, so every request failed.
+
+    The semantic attributes come first; the old selectors stay as the fallback
+    for the previous layout.
+    """
+    from pathlib import Path
+
+    from core.json_engine import JsonEngine
+
+    engines_dir = Path(__file__).parent.parent / "engines"
+    selectors = JsonEngine(engines_dir / "chatgpt.json").response_area_selectors
+
+    assert selectors[:3] == [
+        "[data-response-body]",
+        "[data-markdown-text-style='assistant-message']",
+        "[data-dil-response]",
+    ]
+    assert "[data-message-author-role='assistant']" in selectors
+    assert "div.markdown.prose" in selectors
+
+
 def test_gemini_authenticated_selectors_exclude_chat_ui():
     """Chat input/response classes must not be treated as a login signal.
 

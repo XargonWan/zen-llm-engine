@@ -33,6 +33,9 @@
       "button[aria-label*='Send']"
     ],
     "response_area": [
+      "[data-response-body]",
+      "[data-markdown-text-style='assistant-message']",
+      "[data-dil-response]",
       "[data-message-author-role='assistant']",
       "div.markdown.prose",
       "div.markdown",
