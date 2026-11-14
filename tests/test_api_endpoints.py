@@ -1124,6 +1124,82 @@ def test_chatgpt_opens_a_fresh_chat_for_every_request():
     assert engine._fresh_chat_per_request is True
 
 
+def test_chatgpt_context_full_banner_is_configured():
+    from pathlib import Path
+
+    from core.json_engine import JsonEngine
+
+    engine = JsonEngine(Path(__file__).parent.parent / "engines" / "chatgpt.json")
+
+    assert engine.context_full_banner_text == ["Context window full"]
+    assert engine.context_full_button_text == ["New chat"]
+
+
+def _context_full_engine():
+    import tempfile
+
+    from core.zendriver_llm_base import ZendriverLLMBase
+
+    engine = ZendriverLLMBase(
+        service_url="https://example.com",
+        model_limits_map={"default": 1000},
+        default_model="default",
+        profile_dir=tempfile.mkdtemp(),
+    )
+    engine.context_full_banner_text = ["Context window full"]
+    engine.context_full_button_text = ["New chat"]
+    engine._wait_for_page_ready = AsyncMock(return_value=True)
+    return engine
+
+
+def test_context_full_banner_absent_does_nothing():
+    engine = _context_full_engine()
+    tab = make_tab(evaluate=AsyncMock(return_value="absent"))
+
+    assert asyncio.run(engine._start_new_chat_if_context_full(tab)) is False
+    tab.get.assert_not_awaited()
+
+
+def test_context_full_banner_without_configuration_is_never_probed():
+    engine = _context_full_engine()
+    engine.context_full_banner_text = []
+    tab = make_tab()
+
+    assert asyncio.run(engine._start_new_chat_if_context_full(tab)) is False
+    tab.evaluate.assert_not_awaited()
+
+
+def test_context_full_banner_button_is_pressed_and_no_navigation_needed():
+    engine = _context_full_engine()
+    # present -> click -> clicked -> banner gone
+    tab = make_tab(evaluate=AsyncMock(side_effect=["present", "clicked", "absent"]))
+
+    assert asyncio.run(engine._start_new_chat_if_context_full(tab)) is True
+    tab.get.assert_not_awaited()
+
+
+def test_context_full_banner_without_a_button_falls_back_to_a_fresh_chat():
+    engine = _context_full_engine()
+    # present -> click finds no matching button -> after navigating it is gone
+    tab = make_tab(evaluate=AsyncMock(side_effect=["present", "no-button", "absent"]))
+
+    assert asyncio.run(engine._start_new_chat_if_context_full(tab)) is True
+    tab.get.assert_awaited_once_with("https://example.com")
+
+
+def test_context_full_probe_passes_the_configured_texts_to_the_page():
+    import json
+
+    engine = _context_full_engine()
+    tab = make_tab(evaluate=AsyncMock(return_value="absent"))
+
+    asyncio.run(engine._context_full_probe(tab, click=True))
+
+    script = tab.evaluate.await_args.args[0]
+    cfg = json.loads(script.rsplit(")(", 1)[1].rstrip(")"))
+    assert cfg == {"banner": ["Context window full"], "button": ["New chat"], "click": True}
+
+
 def test_gemini_authenticated_selectors_exclude_chat_ui():
     """Chat input/response classes must not be treated as a login signal.
 

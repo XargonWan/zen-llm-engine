@@ -6,6 +6,10 @@
   "notes": "Media support disabled for this engine because file uploads depend on files.oaiusercontent.com, which is blocked or unavailable in the current environment.",
   "default_model": "gpt-4o",
   "fresh_chat_per_request": true,
+  "context_full": {
+    "banner_text": ["Context window full"],
+    "button_text": ["New chat"]
+  },
   "allow_unlogged": true,
   "models": {
     "gpt-4o": 60000,

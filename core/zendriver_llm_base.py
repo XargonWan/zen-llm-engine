@@ -476,6 +476,15 @@ class ZendriverLLMBase:
         ]
         self.accept_button_selectors: list[str] = []
         self.limit_selectors: list[str] = []
+        # A long conversation can fill the model's context. Some web UIs then stop
+        # taking prompts and show a banner with a "new chat" button. When
+        # ``context_full_banner_text`` (case-insensitive substrings of the banner)
+        # is set, a request first looks for that banner and, if it is there,
+        # presses the button whose label matches ``context_full_button_text``;
+        # if that does not clear the banner it opens a fresh chat by navigating to
+        # the service URL. Both lists come from the engine's JSON ("context_full").
+        self.context_full_banner_text: list[str] = []
+        self.context_full_button_text: list[str] = []
         # CSS selectors that match a transient error banner/toast/snackbar the web
         # UI shows when a generation fails (e.g. "Something went wrong (1076)").
         # Such errors are typically rendered outside the response area, so the
@@ -1415,6 +1424,76 @@ class ZendriverLLMBase:
                 return True
         return False
 
+    #: Looks for a "context window full" banner and, with ``click``, presses its button.
+    #: Returns ``absent``, ``present``, ``clicked`` or ``no-button``.
+    _CONTEXT_FULL_JS = """
+    (cfg) => {
+      const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+      const banners = cfg.banner.map(norm).filter(Boolean);
+      const labels = cfg.button.map(norm).filter(Boolean);
+      if (!banners.length) return 'absent';
+      const holders = document.querySelectorAll("aside, [role='status'], [role='alert'], [role='dialog']");
+      for (const el of holders) {
+        const text = norm(el.innerText || el.textContent);
+        if (!banners.some((b) => text.includes(b))) continue;
+        if (!cfg.click) return 'present';
+        for (const btn of el.querySelectorAll("button, [role='button']")) {
+          const label = norm(btn.innerText || btn.getAttribute('aria-label'));
+          if (label && labels.some((l) => label === l || label.includes(l))) {
+            btn.click();
+            return 'clicked';
+          }
+        }
+        return 'no-button';
+      }
+      return 'absent';
+    }
+    """
+
+    async def _context_full_probe(self, tab: zd.Tab, click: bool = False) -> str:
+        """State of the "context window full" banner: absent / present / clicked / no-button."""
+        if not self.context_full_banner_text:
+            return "absent"
+        cfg = {
+            "banner": list(self.context_full_banner_text),
+            "button": list(self.context_full_button_text),
+            "click": bool(click),
+        }
+        try:
+            result = await tab.evaluate("(" + self._CONTEXT_FULL_JS + ")(" + json.dumps(cfg) + ")")
+        except Exception as exc:  # noqa: BLE001 - a CDP hiccup must not fail the request
+            logger.debug("[zendriver] context-full probe failed: %s", exc)
+            return "absent"
+        return result if isinstance(result, str) else "absent"
+
+    async def _start_new_chat_if_context_full(self, tab: zd.Tab) -> bool:
+        """Leave a conversation whose context is full. True when a new chat was started.
+
+        Presses the banner's button; if the banner is still there afterwards (or the
+        button is missing) it opens a fresh chat by navigating to the service URL.
+        """
+        if await self._context_full_probe(tab) == "absent":
+            return False
+        logger.warning("[zendriver] The conversation's context window is full — starting a new chat")
+        if await self._context_full_probe(tab, click=True) == "clicked":
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                await asyncio.sleep(0.5)
+                if await self._context_full_probe(tab) == "absent":
+                    await self._wait_for_page_ready(tab, timeout=15.0)
+                    logger.info("[zendriver] New chat started from the context-full banner")
+                    return True
+            logger.warning("[zendriver] The context-full banner is still shown after the click")
+        else:
+            logger.warning("[zendriver] The context-full banner has no matching button")
+        await asyncio.wait_for(tab.get(self.service_url), timeout=120)
+        await self._wait_for_page_ready(tab, timeout=30.0)
+        if await self._context_full_probe(tab) != "absent":
+            logger.error("[zendriver] The context-full banner is still shown on a fresh chat")
+        else:
+            logger.info("[zendriver] New chat opened by navigating to the service URL")
+        return True
+
     async def _is_limit_present(self, tab: zd.Tab) -> bool:
         for selector in self.limit_selectors:
             els = await self._query_all(tab, selector)
@@ -1850,6 +1929,9 @@ class ZendriverLLMBase:
         logger.info(f"[timing] page_ready: {t1 - t0:.2f}s")
 
         await self._click_accept_buttons(tab, timeout=2.0)
+
+        # A full conversation refuses prompts: leave it before sending anything.
+        await self._start_new_chat_if_context_full(tab)
 
         if await self._is_captcha_present(tab):
             logger.warning("[zendriver] Cloudflare captcha challenge detected on page")

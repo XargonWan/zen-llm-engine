@@ -179,6 +179,13 @@ class JsonEngine(ZendriverLLMBase):
         # initial thinking delay isn't mistaken for a freeze.
         if "silent_freeze_threshold" in config:
             self._silent_freeze_threshold = float(config["silent_freeze_threshold"])
+        # Optional JSON key "context_full": the banner a long conversation ends with and the
+        # button that leaves it, e.g. {"banner_text": ["..."], "button_text": ["..."]}. Both are
+        # case-insensitive substrings of what the page shows (see _start_new_chat_if_context_full).
+        context_full = config.get("context_full") or {}
+        if isinstance(context_full, dict):
+            self.context_full_banner_text = [str(t) for t in context_full.get("banner_text", [])]
+            self.context_full_button_text = [str(t) for t in context_full.get("button_text", [])]
         if "vision_prompt_prefix" in config:
             self._vision_prompt_prefix = str(config["vision_prompt_prefix"])
         if "inline_response_prefix" in config:
